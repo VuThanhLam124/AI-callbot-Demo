@@ -215,6 +215,7 @@ File chạy web UI: `app_gradio.py`
 Tính năng:
 - Text chat với vLLM (OpenAI-compatible API).
 - Voice input (microphone/upload) -> ASR PhoWhisper -> gửi vào chatbot.
+- Realtime voice trong browser: bật `Bật realtime voice`, bot tự gửi khi bạn dừng nói.
 - Có fallback rule-based nếu vLLM chưa sẵn sàng.
 - Request tới vLLM có `enable_thinking=false` để giảm độ trễ.
 - Có tool-system dùng `sample_data` để bot trả lời logic hơn cho các tác vụ:

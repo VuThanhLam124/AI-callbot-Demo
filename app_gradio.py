@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import inspect
+import math
 import os
 from dataclasses import dataclass
 from typing import Any
@@ -34,6 +35,99 @@ class ASRSettings:
     log_prob_threshold: float
 
 
+@dataclass
+class RealtimeConfig:
+    sample_rate: int = 16000
+    frame_ms: int = 20
+    min_speech_ms: int = 240
+    endpoint_silence_ms: int = 520
+    speech_rms_threshold: float = 0.012
+
+    @property
+    def bytes_per_frame(self) -> int:
+        return int(self.sample_rate * (self.frame_ms / 1000.0) * 2)
+
+    @property
+    def min_speech_frames(self) -> int:
+        return max(1, self.min_speech_ms // self.frame_ms)
+
+    @property
+    def endpoint_silence_frames(self) -> int:
+        return max(1, self.endpoint_silence_ms // self.frame_ms)
+
+
+def _pcm16_rms(pcm16_bytes: bytes) -> float:
+    if not pcm16_bytes:
+        return 0.0
+    samples = memoryview(pcm16_bytes).cast("h")
+    if not samples:
+        return 0.0
+    mean_square = sum(int(s) * int(s) for s in samples) / len(samples)
+    return math.sqrt(mean_square) / 32768.0
+
+
+class RealtimeTurnDetector:
+    """Lightweight endpointing for Gradio audio stream chunks."""
+
+    def __init__(self, cfg: RealtimeConfig):
+        self.cfg = cfg
+        self._in_speech = False
+        self._speech_frames = 0
+        self._silence_frames = 0
+        self._buffer = bytearray()
+        self._tail = bytearray()
+
+    def reset(self) -> None:
+        self._in_speech = False
+        self._speech_frames = 0
+        self._silence_frames = 0
+        self._buffer.clear()
+        self._tail.clear()
+
+    def feed(self, pcm16_chunk: bytes) -> list[bytes]:
+        if not pcm16_chunk:
+            return []
+        data = bytes(self._tail) + pcm16_chunk
+        frame_size = self.cfg.bytes_per_frame
+        finalized: list[bytes] = []
+
+        full_len = (len(data) // frame_size) * frame_size
+        self._tail = bytearray(data[full_len:])
+
+        for start in range(0, full_len, frame_size):
+            frame = data[start : start + frame_size]
+            rms = _pcm16_rms(frame)
+            is_speech = rms >= self.cfg.speech_rms_threshold
+
+            if is_speech:
+                if not self._in_speech:
+                    self._in_speech = True
+                    self._speech_frames = 0
+                    self._silence_frames = 0
+                    self._buffer.clear()
+                self._speech_frames += 1
+                self._silence_frames = 0
+                self._buffer.extend(frame)
+                continue
+
+            if not self._in_speech:
+                continue
+
+            self._silence_frames += 1
+            self._buffer.extend(frame)
+            if self._silence_frames < self.cfg.endpoint_silence_frames:
+                continue
+
+            if self._speech_frames >= self.cfg.min_speech_frames:
+                finalized.append(bytes(self._buffer))
+            self._in_speech = False
+            self._speech_frames = 0
+            self._silence_frames = 0
+            self._buffer.clear()
+
+        return finalized
+
+
 ASR_CACHE: dict[tuple[str, str, str], Any] = {}
 TOOL_SYSTEM = TelecomToolSystem()
 TOOL_AGENT = LLMToolAgent(TOOL_SYSTEM)
@@ -41,6 +135,13 @@ CHATBOT_SUPPORTS_TYPE = "type" in inspect.signature(gr.Chatbot.__init__).paramet
 CHATBOT_MODE = os.getenv("GRADIO_CHATBOT_MODE", "messages").strip().lower()
 if CHATBOT_MODE not in {"messages", "tuples"}:
     CHATBOT_MODE = "messages"
+
+
+def _new_realtime_state() -> dict[str, Any]:
+    return {
+        "detector": None,
+        "cfg_key": None,
+    }
 
 
 def _append_chat_history(
@@ -237,8 +338,187 @@ def _transcribe_audio(
         return "", f"ASR lỗi: {type(exc).__name__}"
 
 
-def _reset_conversation() -> tuple[list[Any], list[dict[str, str]], dict, str, str]:
-    return [], [], {}, "", "Đã xóa lịch sử hội thoại."
+def _resample_audio(audio: Any, source_sr: int, target_sr: int) -> Any:
+    if source_sr == target_sr:
+        return audio
+    try:
+        import numpy as np  # type: ignore
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("Missing dependency 'numpy'.") from exc
+    if len(audio) == 0:
+        return audio
+    target_len = max(1, int(len(audio) * target_sr / source_sr))
+    src_x = np.linspace(0.0, 1.0, num=len(audio), endpoint=False)
+    dst_x = np.linspace(0.0, 1.0, num=target_len, endpoint=False)
+    return np.interp(dst_x, src_x, audio).astype(np.float32)
+
+
+def _chunk_to_pcm16(audio_chunk: Any, target_sr: int = 16000) -> bytes:
+    if audio_chunk is None:
+        return b""
+    if not isinstance(audio_chunk, (tuple, list)) or len(audio_chunk) != 2:
+        return b""
+
+    source_sr, data = audio_chunk
+    if data is None:
+        return b""
+
+    try:
+        import numpy as np  # type: ignore
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("Missing dependency 'numpy'.") from exc
+
+    arr = np.asarray(data)
+    if arr.size == 0:
+        return b""
+
+    if arr.ndim == 2:
+        arr = arr.mean(axis=1)
+    arr = arr.astype(np.float32).reshape(-1)
+
+    # Browser audio from Gradio is usually float in [-1, 1]. Convert robustly.
+    if np.max(np.abs(arr)) > 1.5:
+        arr = arr / 32768.0
+
+    sr = int(source_sr)
+    if sr <= 0:
+        sr = target_sr
+    if sr != target_sr:
+        arr = _resample_audio(arr, sr, target_sr)
+
+    arr = np.clip(arr, -1.0, 1.0)
+    pcm = (arr * 32767.0).astype(np.int16)
+    return pcm.tobytes()
+
+
+def _transcribe_pcm16(
+    pcm16_bytes: bytes,
+    settings: ASRSettings,
+) -> str:
+    if not pcm16_bytes:
+        return ""
+    try:
+        import numpy as np  # type: ignore
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("Missing dependency 'numpy'.") from exc
+
+    model = _get_asr_model(settings)
+    audio = np.frombuffer(pcm16_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+    segments, _ = model.transcribe(
+        audio,
+        language=settings.language,
+        beam_size=settings.beam_size,
+        vad_filter=False,
+        condition_on_previous_text=False,
+        no_speech_threshold=settings.no_speech_threshold,
+        log_prob_threshold=settings.log_prob_threshold,
+        temperature=0.0,
+    )
+    return " ".join(seg.text.strip() for seg in segments).strip()
+
+
+def _realtime_stream_step(
+    audio_chunk: Any,
+    realtime_state: dict[str, Any] | None,
+    chat_history: list[Any] | None,
+    llm_messages: list[dict[str, str]] | None,
+    tool_state: dict | None,
+    base_url: str,
+    model: str,
+    system_prompt: str,
+    phone: str,
+    use_vllm: bool,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    asr_model_path: str,
+    asr_device: str,
+    asr_compute_type: str,
+    asr_language: str,
+    asr_beam_size: int,
+    asr_no_speech_threshold: float,
+    asr_log_prob_threshold: float,
+    realtime_enabled: bool,
+    realtime_rms_threshold: float,
+    realtime_min_speech_ms: int,
+    realtime_endpoint_silence_ms: int,
+) -> tuple[dict[str, Any], list[Any], list[dict[str, str]], dict, str, str]:
+    history = list(chat_history or [])
+    messages = list(llm_messages or [])
+    state = dict(tool_state or {})
+    rt = dict(realtime_state or _new_realtime_state())
+
+    if not realtime_enabled:
+        rt["detector"] = None
+        return rt, history, messages, state, "", "Realtime mic đang tắt."
+
+    cfg = RealtimeConfig(
+        sample_rate=16000,
+        frame_ms=20,
+        min_speech_ms=int(realtime_min_speech_ms),
+        endpoint_silence_ms=int(realtime_endpoint_silence_ms),
+        speech_rms_threshold=float(realtime_rms_threshold),
+    )
+    cfg_key = (
+        cfg.sample_rate,
+        cfg.frame_ms,
+        cfg.min_speech_ms,
+        cfg.endpoint_silence_ms,
+        round(cfg.speech_rms_threshold, 4),
+    )
+    detector = rt.get("detector")
+    if detector is None or rt.get("cfg_key") != cfg_key:
+        detector = RealtimeTurnDetector(cfg)
+        rt["detector"] = detector
+        rt["cfg_key"] = cfg_key
+
+    pcm_chunk = _chunk_to_pcm16(audio_chunk, target_sr=cfg.sample_rate)
+    if not pcm_chunk:
+        return rt, history, messages, state, "", "Đang nghe realtime..."
+
+    asr_settings = ASRSettings(
+        model_path=asr_model_path,
+        device=asr_device,
+        compute_type=asr_compute_type,
+        language=asr_language,
+        beam_size=int(asr_beam_size),
+        no_speech_threshold=float(asr_no_speech_threshold),
+        log_prob_threshold=float(asr_log_prob_threshold),
+    )
+
+    final_utterances = detector.feed(pcm_chunk)
+    if not final_utterances:
+        return rt, history, messages, state, "", "Đang nghe realtime..."
+
+    latest_transcript = ""
+    latest_status = "Đang nghe realtime..."
+    for utterance in final_utterances:
+        user_text = _transcribe_pcm16(utterance, asr_settings).strip()
+        if not user_text:
+            continue
+        latest_transcript = user_text
+        _, history, messages, state, latest_status = _chat_once(
+            user_text=user_text,
+            chat_history=history,
+            llm_messages=messages,
+            tool_state=state,
+            base_url=base_url,
+            model=model,
+            system_prompt=system_prompt,
+            phone=phone,
+            use_vllm=use_vllm,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=int(max_tokens),
+        )
+
+    if latest_transcript:
+        return rt, history, messages, state, latest_transcript, latest_status
+    return rt, history, messages, state, "", "ASR realtime chưa nhận được câu rõ ràng."
+
+
+def _reset_conversation() -> tuple[list[Any], list[dict[str, str]], dict, str, str, dict[str, Any], str]:
+    return [], [], {}, "", "Đã xóa lịch sử hội thoại.", _new_realtime_state(), ""
 
 
 def build_ui() -> gr.Blocks:
@@ -265,6 +545,7 @@ def build_ui() -> gr.Blocks:
         chat_history = gr.Chatbot(**chatbot_kwargs)
         llm_state = gr.State([])
         tool_state = gr.State({})
+        realtime_state = gr.State(_new_realtime_state())
 
         with gr.Accordion("Cấu hình runtime", open=False):
             with gr.Row():
@@ -335,6 +616,45 @@ def build_ui() -> gr.Blocks:
                     transcribe_btn = gr.Button("Chuyển giọng nói thành văn bản")
                     send_transcript_btn = gr.Button("Gửi transcript", variant="primary")
                 transcript_box = gr.Textbox(label="Transcript", lines=3)
+                gr.Markdown("### Realtime mic (tự gửi khi bạn dừng nói)")
+                realtime_enabled = gr.Checkbox(
+                    label="Bật realtime voice",
+                    value=False,
+                    info="Khi bật, bot tự nhận tiếng nói và tự phản hồi, không cần bấm Gửi transcript.",
+                )
+                with gr.Row():
+                    realtime_rms_threshold = gr.Slider(
+                        0.005,
+                        0.06,
+                        value=0.012,
+                        step=0.001,
+                        label="Realtime RMS threshold",
+                    )
+                    realtime_min_speech_ms = gr.Slider(
+                        120,
+                        800,
+                        value=240,
+                        step=20,
+                        label="Realtime Min Speech (ms)",
+                    )
+                    realtime_endpoint_silence_ms = gr.Slider(
+                        250,
+                        1400,
+                        value=520,
+                        step=20,
+                        label="Realtime Endpoint Silence (ms)",
+                    )
+                realtime_audio = gr.Audio(
+                    sources=["microphone"],
+                    type="numpy",
+                    streaming=True,
+                    label="Realtime microphone stream",
+                )
+                realtime_transcript = gr.Textbox(
+                    label="Transcript realtime (auto)",
+                    lines=2,
+                    interactive=False,
+                )
 
         common_inputs = [
             chat_history,
@@ -381,10 +701,56 @@ def build_ui() -> gr.Blocks:
             outputs=[transcript_box, chat_history, llm_state, tool_state, status],
         )
 
+        realtime_audio.stream(
+            fn=_realtime_stream_step,
+            inputs=[
+                realtime_audio,
+                realtime_state,
+                chat_history,
+                llm_state,
+                tool_state,
+                base_url,
+                model_name,
+                system_prompt,
+                phone,
+                use_vllm,
+                temperature,
+                top_p,
+                max_tokens,
+                asr_model_path,
+                asr_device,
+                asr_compute_type,
+                asr_language,
+                asr_beam_size,
+                asr_no_speech_threshold,
+                asr_log_prob_threshold,
+                realtime_enabled,
+                realtime_rms_threshold,
+                realtime_min_speech_ms,
+                realtime_endpoint_silence_ms,
+            ],
+            outputs=[
+                realtime_state,
+                chat_history,
+                llm_state,
+                tool_state,
+                realtime_transcript,
+                status,
+            ],
+        )
+
         clear_btn.click(
             fn=_reset_conversation,
             inputs=[],
-            outputs=[chat_history, llm_state, tool_state, text_input, status],
+            outputs=[
+                chat_history,
+                llm_state,
+                tool_state,
+                text_input,
+                status,
+                realtime_state,
+                realtime_transcript,
+            ],
         )
 
     return demo
