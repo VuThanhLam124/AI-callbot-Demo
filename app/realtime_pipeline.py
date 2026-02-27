@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from app.llm_tool_agent import LLMToolAgent
 from app.tool_system import TelecomToolSystem
 
 
@@ -330,6 +331,7 @@ class RealtimeCallbot:
         self.audio_q: queue.Queue[bytes] = queue.Queue(maxsize=300)
         self.messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
         self.tool_system = TelecomToolSystem()
+        self.tool_agent = LLMToolAgent(self.tool_system)
         self.tool_state: dict[str, Any] = {}
 
     def _on_audio_frame(self, indata: bytes) -> None:
@@ -424,27 +426,27 @@ class RealtimeCallbot:
         self.messages.append({"role": "user", "content": user_text})
 
         assistant_text = ""
-        if self.use_tools:
-            handled, tool_reply, self.tool_state, tool_name = self.tool_system.handle(
-                user_text,
-                self.phone,
-                self.tool_state,
-            )
-            if handled:
-                assistant_text = tool_reply
-                print(f"[TOOL] Đã xử lý bằng tool: {tool_name}")
-
-        if not assistant_text:
-            try:
-                assistant_text = self.llm.chat(self.messages).strip()
-            except Exception as exc:
-                assistant_text = (
-                    "Xin lỗi, tôi đang gặp lỗi kết nối AI server. "
-                    f"Chi tiết: {type(exc).__name__}"
+        try:
+            if self.use_tools:
+                assistant_text, self.messages, self.tool_state, used_tools = self.tool_agent.run_turn(
+                    messages=self.messages,
+                    phone=self.phone,
+                    state=self.tool_state,
+                    llm_chat=self.llm.chat,
                 )
+                if used_tools:
+                    print(f"[TOOL] LLM đã gọi: {', '.join(used_tools)}")
+            else:
+                assistant_text = self.llm.chat(self.messages).strip()
+        except Exception as exc:
+            assistant_text = (
+                "Xin lỗi, tôi đang gặp lỗi kết nối AI server. "
+                f"Chi tiết: {type(exc).__name__}"
+            )
 
         if not assistant_text:
             assistant_text = "Xin lỗi, tôi chưa nghe rõ. Bạn có thể nói lại giúp tôi không?"
 
-        self.messages.append({"role": "assistant", "content": assistant_text})
+        if not self.messages or self.messages[-1].get("role") != "assistant":
+            self.messages.append({"role": "assistant", "content": assistant_text})
         self.tts.speak_async(assistant_text)

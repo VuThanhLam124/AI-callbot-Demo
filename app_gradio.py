@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import os
 from dataclasses import dataclass
 from typing import Any
@@ -11,6 +12,7 @@ from typing import Any
 import requests
 
 from app.callbot import TelecomCallbot
+from app.llm_tool_agent import LLMToolAgent
 from app.tool_system import TelecomToolSystem
 
 try:
@@ -34,6 +36,25 @@ class ASRSettings:
 
 ASR_CACHE: dict[tuple[str, str, str], Any] = {}
 TOOL_SYSTEM = TelecomToolSystem()
+TOOL_AGENT = LLMToolAgent(TOOL_SYSTEM)
+CHATBOT_SUPPORTS_TYPE = "type" in inspect.signature(gr.Chatbot.__init__).parameters
+CHATBOT_MODE = os.getenv("GRADIO_CHATBOT_MODE", "messages").strip().lower()
+if CHATBOT_MODE not in {"messages", "tuples"}:
+    CHATBOT_MODE = "messages"
+
+
+def _append_chat_history(
+    history: list[Any],
+    user_text: str,
+    assistant_text: str,
+) -> list[Any]:
+    if CHATBOT_MODE == "messages":
+        history.append({"role": "user", "content": user_text})
+        history.append({"role": "assistant", "content": assistant_text})
+    else:
+        # Legacy Gradio tuple format: (user, assistant)
+        history.append((user_text, assistant_text))
+    return history
 
 
 def _normalize_vllm_base_url(base_url: str) -> str:
@@ -66,7 +87,8 @@ def _call_vllm(
         "chat_template_kwargs": {"enable_thinking": False},
     }
     resp = requests.post(endpoint, json=payload, timeout=60)
-    resp.raise_for_status()
+    if resp.status_code >= 400:
+        raise RuntimeError(f"vLLM HTTP {resp.status_code}: {resp.text[:400]}")
     data = resp.json()
     return data["choices"][0]["message"]["content"].strip()
 
@@ -93,7 +115,7 @@ def _ensure_system_message(
 
 def _chat_once(
     user_text: str,
-    chat_history: list[dict[str, str]] | None,
+    chat_history: list[Any] | None,
     llm_messages: list[dict[str, str]] | None,
     tool_state: dict | None,
     base_url: str,
@@ -104,7 +126,7 @@ def _chat_once(
     temperature: float,
     top_p: float,
     max_tokens: int,
-) -> tuple[str, list[dict[str, str]], list[dict[str, str]], dict, str]:
+) -> tuple[str, list[Any], list[dict[str, str]], dict, str]:
     text = (user_text or "").strip()
     history = list(chat_history or [])
     messages = _ensure_system_message(list(llm_messages or []), system_prompt)
@@ -113,36 +135,41 @@ def _chat_once(
     if not text:
         return "", history, messages, state, "Vui lòng nhập hoặc chuyển giọng nói thành văn bản trước."
 
-    history.append({"role": "user", "content": text})
     messages.append({"role": "user", "content": text})
 
-    handled, tool_reply, state, tool_name = TOOL_SYSTEM.handle(text, phone, state)
-    if handled:
-        assistant = tool_reply
-        status = f"Đã xử lý bằng tool: {tool_name}"
-    else:
-        status = "Đang dùng fallback rule-based."
-        if use_vllm:
-            try:
-                assistant = _call_vllm(
+    if use_vllm:
+        try:
+            assistant, messages, state, used_tools = TOOL_AGENT.run_turn(
+                messages=messages,
+                phone=phone,
+                state=state,
+                llm_chat=lambda chat_messages: _call_vllm(
                     base_url=base_url,
                     model=model,
-                    messages=messages,
+                    messages=chat_messages,
                     temperature=temperature,
                     top_p=top_p,
                     max_tokens=max_tokens,
-                )
-                if not assistant:
-                    assistant = "Xin lỗi, tôi chưa nghe rõ. Bạn có thể nói lại giúp tôi không?"
-                status = "vLLM phản hồi thành công (enable_thinking=false)."
-            except Exception as exc:
-                assistant = _fallback_reply(text, phone)
-                status = f"vLLM không khả dụng, chuyển fallback ({type(exc).__name__})."
-        else:
-            assistant = _fallback_reply(text, phone)
+                ),
+            )
+            if not assistant:
+                assistant = "Xin lỗi, tôi chưa nghe rõ. Bạn có thể nói lại giúp tôi không?"
+                messages.append({"role": "assistant", "content": assistant})
 
-    history.append({"role": "assistant", "content": assistant})
-    messages.append({"role": "assistant", "content": assistant})
+            if used_tools:
+                status = "vLLM phản hồi thành công. Tools: " + ", ".join(used_tools)
+            else:
+                status = "vLLM phản hồi thành công. Không cần gọi tool."
+        except Exception as exc:
+            assistant = _fallback_reply(text, phone)
+            messages.append({"role": "assistant", "content": assistant})
+            status = f"vLLM không khả dụng, chuyển fallback ({type(exc).__name__})."
+    else:
+        assistant = _fallback_reply(text, phone)
+        messages.append({"role": "assistant", "content": assistant})
+        status = "Đang dùng fallback rule-based."
+
+    history = _append_chat_history(history, text, assistant)
     return "", history, messages, state, status
 
 
@@ -210,7 +237,7 @@ def _transcribe_audio(
         return "", f"ASR lỗi: {type(exc).__name__}"
 
 
-def _reset_conversation() -> tuple[list[dict[str, str]], list[dict[str, str]], dict, str, str]:
+def _reset_conversation() -> tuple[list[Any], list[dict[str, str]], dict, str, str]:
     return [], [], {}, "", "Đã xóa lịch sử hội thoại."
 
 
@@ -219,7 +246,7 @@ def build_ui() -> gr.Blocks:
     default_model = os.getenv("VLLM_MODEL", "Qwen/Qwen3-1.7B-GPTQ-Int8")
     default_asr_path = os.getenv("ASR_MODEL_PATH", "models/PhoWhisper-small-ct2")
 
-    with gr.Blocks(title="VNPost Telecom Callbot", theme=gr.themes.Soft()) as demo:
+    with gr.Blocks(title="VNPost Telecom Callbot") as demo:
         gr.Markdown(
             """
             # VNPost Telecom Callbot (Gradio)
@@ -227,12 +254,15 @@ def build_ui() -> gr.Blocks:
             - ASR: PhoWhisper-small (CTranslate2 via faster-whisper)
             - LLM: vLLM OpenAI-compatible API
             - Yêu cầu chat luôn dùng `enable_thinking=false`
-            - Có tool system bám theo sample data để trả lời logic hơn
+            - LLM tự quyết định gọi tool để lấy dữ liệu mẫu trước khi trả lời
             """
         )
 
         status = gr.Textbox(label="Trạng thái", value="Sẵn sàng.", interactive=False)
-        chat_history = gr.Chatbot(label="Hội thoại", type="messages", height=420)
+        chatbot_kwargs: dict[str, Any] = {"label": "Hội thoại", "height": 420}
+        if CHATBOT_SUPPORTS_TYPE:
+            chatbot_kwargs["type"] = "messages"
+        chat_history = gr.Chatbot(**chatbot_kwargs)
         llm_state = gr.State([])
         tool_state = gr.State({})
 
@@ -246,13 +276,14 @@ def build_ui() -> gr.Blocks:
             with gr.Row():
                 temperature = gr.Slider(0.0, 1.5, value=0.7, step=0.05, label="Temperature")
                 top_p = gr.Slider(0.1, 1.0, value=0.8, step=0.05, label="Top P")
-                max_tokens = gr.Slider(32, 512, value=160, step=16, label="Max Tokens")
+                max_tokens = gr.Slider(32, 512, value=128, step=16, label="Max Tokens")
             system_prompt = gr.Textbox(
                 label="System Prompt",
                 value=(
                     "Bạn là trợ lý giọng nói VNPost Telecom. "
                     "Luôn trả lời tiếng Việt có dấu, ngắn gọn, rõ ràng. "
-                    "Ưu tiên tư vấn gói cước, ưu đãi SIM và tra cứu thuê bao."
+                    "Ưu tiên tư vấn gói cước, ưu đãi SIM và tra cứu thuê bao. "
+                    "Khi cần dữ liệu giá/số lượng/thông tin thuê bao, hãy gọi tool trước rồi mới trả lời."
                 ),
                 lines=3,
             )

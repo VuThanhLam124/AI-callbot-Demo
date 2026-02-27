@@ -50,14 +50,14 @@ class TelecomCallbot:
     def _reply_inbound(self, user_text: str) -> str:
         if _contains_any(
             user_text,
-            ("gap nhan vien", "gap nguoi that", "tong dai vien", "chuyen nguoi that"),
+            ("gặp nhân viên", "gặp người thật", "tổng đài viên", "chuyển người thật"),
         ):
             self.state = "handover"
             return "Em đã ghi nhận. Đang chuyển máy sang tổng đài viên hỗ trợ anh/chị."
 
         if _contains_any(
             user_text,
-            ("tra cuu", "goi dang dung", "goi hien tai", "thue bao", "tai khoan"),
+            ("tra cứu", "gói đang dùng", "gói hiện tại", "thuê bao", "tài khoản"),
         ):
             if not self.phone:
                 return "Anh/chị vui lòng cung cấp số điện thoại để em tra cứu gói đang sử dụng."
@@ -71,7 +71,7 @@ class TelecomCallbot:
 
         if _contains_any(
             user_text,
-            ("tu van", "goi nao phu hop", "nen dung goi nao", "de xuat", "goi cuoc", "de nghi"),
+            ("tư vấn", "gói nào phù hợp", "nên dùng gói nào", "đề xuất", "gói cước", "đề nghị"),
         ):
             request = RecommendPlanRequest(
                 phone=self.phone,
@@ -101,7 +101,7 @@ class TelecomCallbot:
         )
 
     def _reply_outbound(self, user_text: str) -> str:
-        if _contains_any(user_text, ("khong", "tu choi", "khong quan tam", "thoi")):
+        if _contains_any(user_text, ("không", "từ chối", "không quan tâm", "thôi")):
             self.state = "callback_offer"
             return "Em tôn trọng quyết định của anh/chị. Em có thể hẹn gọi lại vào khung giờ tiện hơn được không?"
 
@@ -116,7 +116,7 @@ class TelecomCallbot:
             self.state = "done"
             return f"Em đã đặt lịch gọi lại (mã {callback.callback_id}). Cảm ơn anh/chị."
 
-        if _contains_any(user_text, ("dong y", "co", "tu van", "nghe", "ok", "duoc")):
+        if _contains_any(user_text, ("đồng ý", "có", "tư vấn", "nghe", "ok", "được")):
             self.state = "offer_sent"
             offers = sample_data.SIM_OFFERS[:2]
             return (

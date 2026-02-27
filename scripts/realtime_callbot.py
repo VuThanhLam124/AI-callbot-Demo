@@ -47,7 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.8)
-    parser.add_argument("--max-tokens", type=int, default=160)
+    parser.add_argument("--max-tokens", type=int, default=128)
 
     parser.add_argument("--tts-mode", default="text", choices=["text", "pyttsx3"])
     parser.add_argument("--tts-rate", type=int, default=180)
@@ -78,6 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Bạn là trợ lý giọng nói VNPost Telecom. "
             "Luôn trả lời tiếng Việt có dấu, ngắn gọn. "
             "Tập trung vào ưu đãi SIM và tra cứu gói cước viễn thông. "
+            "Khi cần dữ liệu giá/số lượng/thông tin thuê bao, hãy gọi tool trước rồi mới trả lời. "
             "Nếu người dùng hỏi ngoài phạm vi, hãy điều hướng lịch sự."
         ),
     )
