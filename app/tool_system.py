@@ -19,7 +19,7 @@ from app.service import (
 
 
 def _normalize(text: str) -> str:
-    lowered = text.lower().replace("đ", "d")
+    lowered = text.lower()
     normalized = unicodedata.normalize("NFD", lowered)
     return "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
 
@@ -53,9 +53,9 @@ def _extract_budget_vnd(text: str) -> int | None:
 
 def _extract_priority(text: str) -> str:
     norm = _normalize(text)
-    if any(k in norm for k in ("thoai", "noi mang", "ngoai mang", "phut", "goi dien")):
+    if any(k in norm for k in ("thoại", "nội mạng", "ngoại mạng", "phút", "cuộc gọi", "call", "gọi")):
         return "call"
-    if any(k in norm for k in ("re", "tiet kiem", "gia", "chi phi", "ngan sach")):
+    if any(k in norm for k in ("rẻ", "tiết kiệm", "giá", "chi phí", "ngân sách", "tài chính")):
         return "price"
     return "data"
 
@@ -96,7 +96,7 @@ class TelecomToolSystem:
 
         if _contains_any(
             user_text,
-            ("uu dai sim", "khuyen mai sim", "goi sim", "sim moi", "mua sim", "danh sach sim"),
+            ("uu dai sim", "khuyen mai sim", "goi sim", "sim moi", "mua sim"),
         ):
             state["last_offer_ids"] = [offer["id"] for offer in sample_data.SIM_OFFERS[:3]]
             lines = [
@@ -114,7 +114,7 @@ class TelecomToolSystem:
 
         if _contains_any(
             user_text,
-            ("goi lai", "hen goi lai", "ban", "de sau", "goi sau"),
+            ("gọi lại", "hẹn gọi lại", "bận", "để sau", "gọi sau"),
         ):
             callback = create_callback(
                 CallbackRequest(
@@ -132,7 +132,7 @@ class TelecomToolSystem:
 
         if _contains_any(
             user_text,
-            ("dong y", "dang ky", "chot", "mua ngay", "lay goi", "chon goi"),
+            ("đồng ý", "đăng ký", "chốt", "mua ngay", "lấy gói", "chọn gói"),
         ):
             selected_offer_id = _extract_offer_selection(user_text, state)
             if not selected_offer_id:
@@ -158,7 +158,7 @@ class TelecomToolSystem:
 
         if _contains_any(
             user_text,
-            ("tra cuu", "goi dang dung", "goi hien tai", "thue bao", "tai khoan"),
+            ("tra cứu", "gói đang dùng", "gói hiện tại", "thuê bao", "tài khoản"),
         ):
             subscriber = get_subscriber(phone)
             if not subscriber:
@@ -190,7 +190,7 @@ class TelecomToolSystem:
 
         if _contains_any(
             user_text,
-            ("goi nao phu hop", "de xuat", "tu van", "nen dung goi nao"),
+            ("gói nào phù hợp", "đề xuất", "tư vấn", "nên dùng gói nào"),
         ):
             budget = _extract_budget_vnd(user_text) or 250000
             priority = _extract_priority(user_text)
@@ -229,7 +229,7 @@ class TelecomToolSystem:
 
         if _contains_any(
             user_text,
-            ("goi cuoc", "bang gia", "gia goi", "goi data", "goi 5g"),
+            ("gói cước", "bảng giá", "giá gói", "gói data", "gói 5g"),
         ):
             budget = _extract_budget_vnd(user_text)
             needs_5g = _contains_any(user_text, ("5g",))
