@@ -42,9 +42,9 @@ class ASRSettings:
 class RealtimeConfig:
     sample_rate: int = 16000
     frame_ms: int = 20
-    min_speech_ms: int = 240
-    endpoint_silence_ms: int = 520
-    speech_rms_threshold: float = 0.012
+    min_speech_ms: int = 180
+    endpoint_silence_ms: int = 420
+    speech_rms_threshold: float = 0.008
 
     @property
     def bytes_per_frame(self) -> int:
@@ -130,6 +130,25 @@ class RealtimeTurnDetector:
 
         return finalized
 
+    def flush(self, force: bool = False) -> list[bytes]:
+        """Finalize current buffered speech when stream stops."""
+        if not self._in_speech:
+            self._tail.clear()
+            return []
+
+        finalized: list[bytes] = []
+        enough_speech = self._speech_frames >= self.cfg.min_speech_frames
+        enough_silence = self._silence_frames >= self.cfg.endpoint_silence_frames
+        if enough_speech and (force or enough_silence):
+            finalized.append(bytes(self._buffer))
+
+        self._in_speech = False
+        self._speech_frames = 0
+        self._silence_frames = 0
+        self._buffer.clear()
+        self._tail.clear()
+        return finalized
+
 
 ASR_CACHE: dict[tuple[str, str, str], Any] = {}
 ASR_PREPARED_PATHS: set[str] = set()
@@ -151,6 +170,17 @@ def _new_realtime_state() -> dict[str, Any]:
         "detector": None,
         "cfg_key": None,
     }
+
+
+def _detect_cuda_available() -> bool:
+    try:
+        import ctranslate2  # type: ignore
+    except Exception:
+        return False
+    try:
+        return int(ctranslate2.get_cuda_device_count()) > 0
+    except Exception:
+        return False
 
 
 def _try_prepare_ct2_model(model_path: str) -> tuple[bool, str]:
@@ -594,6 +624,87 @@ def _transcribe_pcm16(
     return " ".join(seg.text.strip() for seg in segments).strip()
 
 
+def _run_realtime_utterances(
+    utterances: list[bytes],
+    history: list[Any],
+    messages: list[dict[str, str]],
+    state: dict,
+    base_url: str,
+    model: str,
+    system_prompt: str,
+    phone: str,
+    use_vllm: bool,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    asr_settings: ASRSettings,
+    tts_enabled: bool,
+    tts_backbone_repo: str,
+    tts_backbone_device: str,
+    tts_codec_repo: str,
+    tts_codec_device: str,
+    tts_voice_id: str,
+) -> tuple[list[Any], list[dict[str, str]], dict, str, str, Any]:
+    latest_transcript = ""
+    latest_status = "Đang nghe realtime..."
+    bot_audio: Any = None
+
+    for utterance in utterances:
+        try:
+            user_text = _transcribe_pcm16(utterance, asr_settings).strip()
+        except Exception as exc:
+            err = str(exc).strip().replace("\n", " ")
+            return (
+                history,
+                messages,
+                state,
+                "",
+                f"ASR realtime lỗi: {type(exc).__name__}. {err[:220]}",
+                bot_audio,
+            )
+
+        if not user_text:
+            continue
+
+        latest_transcript = user_text
+        _, history, messages, state, latest_status = _chat_once(
+            user_text=user_text,
+            chat_history=history,
+            llm_messages=messages,
+            tool_state=state,
+            base_url=base_url,
+            model=model,
+            system_prompt=system_prompt,
+            phone=phone,
+            use_vllm=use_vllm,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=int(max_tokens),
+        )
+
+        if tts_enabled:
+            assistant_text = ""
+            if messages and messages[-1].get("role") == "assistant":
+                assistant_text = messages[-1].get("content", "")
+            if assistant_text:
+                try:
+                    bot_audio = _synthesize_vieneu_audio(
+                        text=assistant_text,
+                        backbone_repo=tts_backbone_repo,
+                        backbone_device=tts_backbone_device,
+                        codec_repo=tts_codec_repo,
+                        codec_device=tts_codec_device,
+                        voice_id=tts_voice_id,
+                    )
+                except Exception as exc:
+                    latest_status = f"{latest_status} | TTS lỗi: {type(exc).__name__}"
+                    bot_audio = None
+
+    if latest_transcript:
+        return history, messages, state, latest_transcript, latest_status, bot_audio
+    return history, messages, state, "", "ASR realtime chưa nhận được câu rõ ràng.", bot_audio
+
+
 def _realtime_stream_step(
     audio_chunk: Any,
     realtime_state: dict[str, Any] | None,
@@ -672,62 +783,124 @@ def _realtime_stream_step(
 
     final_utterances = detector.feed(pcm_chunk)
     if not final_utterances:
+        chunk_rms = _pcm16_rms(pcm_chunk)
+        if chunk_rms < cfg.speech_rms_threshold:
+            hint = (
+                f"Đang nghe realtime... RMS={chunk_rms:.4f} < ngưỡng {cfg.speech_rms_threshold:.4f}. "
+                "Nếu không bắt tiếng, giảm Realtime RMS threshold."
+            )
+            return rt, history, messages, state, "", hint, bot_audio
         return rt, history, messages, state, "", "Đang nghe realtime...", bot_audio
 
-    latest_transcript = ""
-    latest_status = "Đang nghe realtime..."
-    for utterance in final_utterances:
-        try:
-            user_text = _transcribe_pcm16(utterance, asr_settings).strip()
-        except Exception as exc:
-            err = str(exc).strip().replace("\n", " ")
-            return (
-                rt,
-                history,
-                messages,
-                state,
-                "",
-                f"ASR realtime lỗi: {type(exc).__name__}. {err[:220]}",
-                bot_audio,
-            )
-        if not user_text:
-            continue
-        latest_transcript = user_text
-        _, history, messages, state, latest_status = _chat_once(
-            user_text=user_text,
-            chat_history=history,
-            llm_messages=messages,
-            tool_state=state,
-            base_url=base_url,
-            model=model,
-            system_prompt=system_prompt,
-            phone=phone,
-            use_vllm=use_vllm,
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=int(max_tokens),
-        )
-        if tts_enabled:
-            assistant_text = ""
-            if messages and messages[-1].get("role") == "assistant":
-                assistant_text = messages[-1].get("content", "")
-            if assistant_text:
-                try:
-                    bot_audio = _synthesize_vieneu_audio(
-                        text=assistant_text,
-                        backbone_repo=tts_backbone_repo,
-                        backbone_device=tts_backbone_device,
-                        codec_repo=tts_codec_repo,
-                        codec_device=tts_codec_device,
-                        voice_id=tts_voice_id,
-                    )
-                except Exception as exc:
-                    latest_status = f"{latest_status} | TTS lỗi: {type(exc).__name__}"
-                    bot_audio = None
+    history, messages, state, transcript, turn_status, bot_audio = _run_realtime_utterances(
+        utterances=final_utterances,
+        history=history,
+        messages=messages,
+        state=state,
+        base_url=base_url,
+        model=model,
+        system_prompt=system_prompt,
+        phone=phone,
+        use_vllm=use_vllm,
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens=max_tokens,
+        asr_settings=asr_settings,
+        tts_enabled=tts_enabled,
+        tts_backbone_repo=tts_backbone_repo,
+        tts_backbone_device=tts_backbone_device,
+        tts_codec_repo=tts_codec_repo,
+        tts_codec_device=tts_codec_device,
+        tts_voice_id=tts_voice_id,
+    )
+    return rt, history, messages, state, transcript, turn_status, bot_audio
 
-    if latest_transcript:
-        return rt, history, messages, state, latest_transcript, latest_status, bot_audio
-    return rt, history, messages, state, "", "ASR realtime chưa nhận được câu rõ ràng.", bot_audio
+
+def _realtime_stream_finalize(
+    realtime_state: dict[str, Any] | None,
+    chat_history: list[Any] | None,
+    llm_messages: list[dict[str, str]] | None,
+    tool_state: dict | None,
+    base_url: str,
+    model: str,
+    system_prompt: str,
+    phone: str,
+    use_vllm: bool,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    asr_model_path: str,
+    asr_device: str,
+    asr_compute_type: str,
+    asr_language: str,
+    asr_beam_size: int,
+    asr_no_speech_threshold: float,
+    asr_log_prob_threshold: float,
+    realtime_enabled: bool,
+    tts_enabled: bool,
+    tts_backbone_repo: str,
+    tts_backbone_device: str,
+    tts_codec_repo: str,
+    tts_codec_device: str,
+    tts_voice_id: str,
+) -> tuple[dict[str, Any], list[Any], list[dict[str, str]], dict, str, str, Any]:
+    history = list(chat_history or [])
+    messages = list(llm_messages or [])
+    state = dict(tool_state or {})
+    rt = dict(realtime_state or _new_realtime_state())
+    bot_audio: Any = None
+
+    if not realtime_enabled:
+        return rt, history, messages, state, "", "Realtime mic đang tắt.", bot_audio
+
+    detector = rt.get("detector")
+    if detector is None:
+        return rt, history, messages, state, "", "Chưa có dữ liệu mic để xử lý.", bot_audio
+
+    asr_settings = ASRSettings(
+        model_path=asr_model_path,
+        device=asr_device,
+        compute_type=asr_compute_type,
+        language=asr_language,
+        beam_size=int(asr_beam_size),
+        no_speech_threshold=float(asr_no_speech_threshold),
+        log_prob_threshold=float(asr_log_prob_threshold),
+    )
+
+    final_utterances = detector.flush(force=True)
+    if not final_utterances:
+        return (
+            rt,
+            history,
+            messages,
+            state,
+            "",
+            "Không phát hiện câu nói đủ dài. Hãy nói rõ hơn hoặc tăng thời gian nói.",
+            bot_audio,
+        )
+
+    history, messages, state, transcript, turn_status, bot_audio = _run_realtime_utterances(
+        utterances=final_utterances,
+        history=history,
+        messages=messages,
+        state=state,
+        base_url=base_url,
+        model=model,
+        system_prompt=system_prompt,
+        phone=phone,
+        use_vllm=use_vllm,
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens=max_tokens,
+        asr_settings=asr_settings,
+        tts_enabled=tts_enabled,
+        tts_backbone_repo=tts_backbone_repo,
+        tts_backbone_device=tts_backbone_device,
+        tts_codec_repo=tts_codec_repo,
+        tts_codec_device=tts_codec_device,
+        tts_voice_id=tts_voice_id,
+    )
+    return rt, history, messages, state, transcript, turn_status, bot_audio
 
 
 def _reset_conversation() -> tuple[
@@ -746,6 +919,19 @@ def build_ui() -> gr.Blocks:
     default_base_url = os.getenv("VLLM_BASE_URL", "http://localhost:8002/v1")
     default_model = os.getenv("VLLM_MODEL", "Qwen/Qwen3-1.7B-GPTQ-Int8")
     default_asr_path = os.getenv("ASR_MODEL_PATH", "models/PhoWhisper-small-ct2")
+    asr_compute_choices = ["int8_float16", "float16", "int8", "float32"]
+    default_asr_device = os.getenv(
+        "ASR_DEVICE",
+        "cuda" if _detect_cuda_available() else "cpu",
+    ).strip().lower()
+    if default_asr_device not in {"cuda", "cpu"}:
+        default_asr_device = "cpu"
+    default_asr_compute_type = os.getenv(
+        "ASR_COMPUTE_TYPE",
+        "int8_float16" if default_asr_device == "cuda" else "int8",
+    ).strip()
+    if default_asr_compute_type not in asr_compute_choices:
+        default_asr_compute_type = "int8" if default_asr_device == "cpu" else "int8_float16"
 
     with gr.Blocks(title="VNPost Telecom Callbot") as demo:
         gr.Markdown(
@@ -791,11 +977,15 @@ def build_ui() -> gr.Blocks:
             )
             with gr.Row():
                 asr_model_path = gr.Textbox(label="ASR Model Path", value=default_asr_path)
-                asr_device = gr.Dropdown(label="ASR Device", choices=["cuda", "cpu"], value="cuda")
+                asr_device = gr.Dropdown(
+                    label="ASR Device",
+                    choices=["cuda", "cpu"],
+                    value=default_asr_device,
+                )
                 asr_compute_type = gr.Dropdown(
                     label="ASR Compute Type",
-                    choices=["int8_float16", "float16", "int8", "float32"],
-                    value="int8_float16",
+                    choices=asr_compute_choices,
+                    value=default_asr_compute_type,
                 )
             with gr.Row():
                 asr_language = gr.Textbox(label="ASR Language", value="vi")
@@ -825,21 +1015,21 @@ def build_ui() -> gr.Blocks:
             realtime_rms_threshold = gr.Slider(
                 0.005,
                 0.06,
-                value=0.012,
+                value=0.008,
                 step=0.001,
                 label="Realtime RMS threshold",
             )
             realtime_min_speech_ms = gr.Slider(
                 120,
                 800,
-                value=240,
+                value=180,
                 step=20,
                 label="Realtime Min Speech (ms)",
             )
             realtime_endpoint_silence_ms = gr.Slider(
                 250,
                 1400,
-                value=520,
+                value=420,
                 step=20,
                 label="Realtime Endpoint Silence (ms)",
             )
@@ -956,6 +1146,47 @@ def build_ui() -> gr.Blocks:
                 realtime_bot_audio,
             ],
         )
+        if hasattr(realtime_audio, "stop_recording"):
+            realtime_audio.stop_recording(
+                fn=_realtime_stream_finalize,
+                inputs=[
+                    realtime_state,
+                    chat_history,
+                    llm_state,
+                    tool_state,
+                    base_url,
+                    model_name,
+                    system_prompt,
+                    phone,
+                    use_vllm,
+                    temperature,
+                    top_p,
+                    max_tokens,
+                    asr_model_path,
+                    asr_device,
+                    asr_compute_type,
+                    asr_language,
+                    asr_beam_size,
+                    asr_no_speech_threshold,
+                    asr_log_prob_threshold,
+                    realtime_enabled,
+                    realtime_tts_enabled,
+                    realtime_tts_backbone_repo,
+                    realtime_tts_backbone_device,
+                    realtime_tts_codec_repo,
+                    realtime_tts_codec_device,
+                    realtime_tts_voice_id,
+                ],
+                outputs=[
+                    realtime_state,
+                    chat_history,
+                    llm_state,
+                    tool_state,
+                    realtime_transcript,
+                    status,
+                    realtime_bot_audio,
+                ],
+            )
 
         clear_btn.click(
             fn=_reset_conversation,
