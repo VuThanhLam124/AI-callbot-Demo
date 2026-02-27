@@ -6,3 +6,4 @@ transformers>=4.49.0
 sounddevice>=0.5.1
 webrtcvad-wheels>=2.0.14
 pyttsx3>=2.99
+vieneu>=1.1.6

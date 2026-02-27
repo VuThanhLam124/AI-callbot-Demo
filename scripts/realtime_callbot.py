@@ -21,6 +21,15 @@ from app.realtime_pipeline import (
 )
 
 
+def _parse_device_arg(raw: str) -> str | int | None:
+    value = raw.strip()
+    if not value:
+        return None
+    if value.isdigit():
+        return int(value)
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Realtime callbot demo for VNPost Telecom")
 
@@ -49,8 +58,38 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--top-p", type=float, default=0.8)
     parser.add_argument("--max-tokens", type=int, default=128)
 
-    parser.add_argument("--tts-mode", default="text", choices=["text", "pyttsx3"])
+    parser.add_argument("--tts-mode", default="text", choices=["text", "pyttsx3", "vieneu"])
     parser.add_argument("--tts-rate", type=int, default=180)
+    parser.add_argument(
+        "--tts-vieneu-backbone-repo",
+        default="pnnbao-ump/VieNeu-TTS-0.3B-q4-gguf",
+        help="VieNeu-TTS backbone model repo or local path",
+    )
+    parser.add_argument(
+        "--tts-vieneu-backbone-device",
+        default="cpu",
+        choices=["cpu", "cuda", "mps"],
+    )
+    parser.add_argument(
+        "--tts-vieneu-codec-repo",
+        default="neuphonic/distill-neucodec",
+        help="VieNeu codec repo",
+    )
+    parser.add_argument(
+        "--tts-vieneu-codec-device",
+        default="cpu",
+        choices=["cpu", "cuda", "mps"],
+    )
+    parser.add_argument(
+        "--tts-vieneu-voice-id",
+        default="",
+        help="Optional VieNeu preset voice id (e.g. Tuyen). Leave empty for default.",
+    )
+    parser.add_argument(
+        "--tts-vieneu-streaming",
+        action="store_true",
+        help="Enable VieNeu infer_stream mode (lower latency, may be less stable on weak CPU/audio drivers).",
+    )
 
     parser.add_argument("--sample-rate", type=int, default=16000)
     parser.add_argument("--frame-ms", type=int, default=20)
@@ -58,7 +97,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-speech-ms", type=int, default=260)
     parser.add_argument("--endpoint-silence-ms", type=int, default=550)
     parser.add_argument("--utterance-min-rms", type=float, default=0.010)
-    parser.add_argument("--barge-in-min-rms", type=float, default=0.015)
+    parser.add_argument("--barge-in-min-rms", type=float, default=0.030)
     parser.add_argument(
         "--barge-in-ms",
         type=int,
@@ -70,6 +109,33 @@ def build_parser() -> argparse.ArgumentParser:
         "--disable-barge-in",
         action="store_true",
         help="Disable interruption while bot is speaking",
+    )
+    parser.add_argument(
+        "--post-tts-guard-ms",
+        type=int,
+        default=1100,
+        help="Ignore low-energy utterances right after bot speech ends (mitigate speaker echo)",
+    )
+    parser.add_argument(
+        "--post-tts-guard-rms",
+        type=float,
+        default=0.030,
+        help="RMS threshold used during post-TTS guard window",
+    )
+    parser.add_argument(
+        "--input-device",
+        default="",
+        help="Microphone device id or name for sounddevice input (empty = default)",
+    )
+    parser.add_argument(
+        "--output-device",
+        default="",
+        help="Speaker device id or name for TTS output (empty = default)",
+    )
+    parser.add_argument(
+        "--list-audio-devices",
+        action="store_true",
+        help="List sounddevice input/output devices then exit",
     )
 
     parser.add_argument(
@@ -94,6 +160,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.list_audio_devices:
+        try:
+            import sounddevice as sd  # type: ignore
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "Missing dependency 'sounddevice'. Install requirements-realtime.txt."
+            ) from exc
+        print(sd.query_devices())
+        return
+
+    input_device = _parse_device_arg(args.input_device)
+    output_device = _parse_device_arg(args.output_device)
+
     cfg = AudioConfig(
         sample_rate=args.sample_rate,
         frame_ms=args.frame_ms,
@@ -122,7 +201,17 @@ def main() -> None:
         top_p=args.top_p,
         max_tokens=args.max_tokens,
     )
-    tts = TTSPlayer(mode=args.tts_mode, rate_wpm=args.tts_rate)
+    tts = TTSPlayer(
+        mode=args.tts_mode,
+        rate_wpm=args.tts_rate,
+        output_device=output_device,
+        vieneu_backbone_repo=args.tts_vieneu_backbone_repo,
+        vieneu_backbone_device=args.tts_vieneu_backbone_device,
+        vieneu_codec_repo=args.tts_vieneu_codec_repo,
+        vieneu_codec_device=args.tts_vieneu_codec_device,
+        vieneu_voice_id=args.tts_vieneu_voice_id or None,
+        vieneu_streaming=args.tts_vieneu_streaming,
+    )
 
     bot = RealtimeCallbot(
         asr=asr,
@@ -136,6 +225,9 @@ def main() -> None:
         barge_in_frames=barge_in_frames,
         barge_in_min_bot_ms=args.barge_in_min_bot_ms,
         barge_in_enabled=not args.disable_barge_in,
+        input_device=input_device,
+        post_tts_guard_ms=args.post_tts_guard_ms,
+        post_tts_guard_rms=args.post_tts_guard_rms,
     )
     bot.run()
 

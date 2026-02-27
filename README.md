@@ -156,6 +156,51 @@ Nếu muốn phát âm thanh local:
 python scripts/realtime_callbot.py --tts-mode pyttsx3
 ```
 
+Nếu muốn dùng VieNeu-TTS (khuyến nghị bản nhẹ `0.3B-q4-gguf`):
+
+```bash
+pip install vieneu --extra-index-url https://pnnbao97.github.io/llama-cpp-python-v0.3.16/cpu/
+python scripts/realtime_callbot.py \
+  --tts-mode vieneu \
+  --tts-vieneu-backbone-repo pnnbao-ump/VieNeu-TTS-0.3B-q4-gguf \
+  --tts-vieneu-backbone-device cpu
+```
+
+Mặc định VieNeu chạy non-stream (ổn định hơn, giảm lỗi ALSA underrun).  
+Nếu muốn ưu tiên độ trễ thấp, bật streaming:
+
+```bash
+python scripts/realtime_callbot.py \
+  --tts-mode vieneu \
+  --tts-vieneu-backbone-repo pnnbao-ump/VieNeu-TTS-0.3B-q4-gguf \
+  --tts-vieneu-backbone-device cpu \
+  --tts-vieneu-streaming
+```
+
+Nếu micro vẫn ăn phải tiếng loa, tăng độ ổn định bằng:
+
+```bash
+python scripts/realtime_callbot.py \
+  --tts-mode vieneu \
+  --tts-vieneu-backbone-repo pnnbao-ump/VieNeu-TTS-0.3B-q4-gguf \
+  --tts-vieneu-backbone-device cpu \
+  --barge-in-ms 420 \
+  --barge-in-min-rms 0.035 \
+  --utterance-min-rms 0.015 \
+  --post-tts-guard-ms 1400 \
+  --post-tts-guard-rms 0.035
+```
+
+Để chọn đúng mic/loa (tránh loopback thiết bị mặc định):
+
+```bash
+python scripts/realtime_callbot.py --list-audio-devices
+python scripts/realtime_callbot.py \
+  --tts-mode vieneu \
+  --input-device 2 \
+  --output-device 5
+```
+
 Note:
 - `barge-in` mặc định 320ms speech liên tục để ngắt bot (`--barge-in-ms`).
 - `enable_thinking=false` đã được hard-code trong `app/realtime_pipeline.py` khi gọi vLLM OpenAI API.
