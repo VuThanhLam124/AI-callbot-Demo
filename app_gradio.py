@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import inspect
 import math
 import os
+import subprocess
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -129,12 +132,18 @@ class RealtimeTurnDetector:
 
 
 ASR_CACHE: dict[tuple[str, str, str], Any] = {}
+ASR_PREPARED_PATHS: set[str] = set()
+ASR_PREP_LOCK = threading.Lock()
 TOOL_SYSTEM = TelecomToolSystem()
 TOOL_AGENT = LLMToolAgent(TOOL_SYSTEM)
 CHATBOT_SUPPORTS_TYPE = "type" in inspect.signature(gr.Chatbot.__init__).parameters
 CHATBOT_MODE = os.getenv("GRADIO_CHATBOT_MODE", "messages").strip().lower()
 if CHATBOT_MODE not in {"messages", "tuples"}:
     CHATBOT_MODE = "messages"
+AUDIO_SUPPORTS_AUTOPLAY = "autoplay" in inspect.signature(gr.Audio.__init__).parameters
+TTS_CACHE: dict[tuple[str, str, str, str, str], tuple[Any, Any]] = {}
+TTS_LOCK = threading.Lock()
+VIENEU_AVAILABLE = importlib.util.find_spec("vieneu") is not None
 
 
 def _new_realtime_state() -> dict[str, Any]:
@@ -142,6 +151,160 @@ def _new_realtime_state() -> dict[str, Any]:
         "detector": None,
         "cfg_key": None,
     }
+
+
+def _try_prepare_ct2_model(model_path: str) -> tuple[bool, str]:
+    """Prepare local CTranslate2 model directory when missing."""
+    normalized = os.path.normpath(model_path)
+    if os.path.isdir(normalized):
+        return True, ""
+    if not (
+        normalized.startswith("models" + os.path.sep)
+        or normalized.startswith("." + os.path.sep + "models" + os.path.sep)
+    ):
+        return False, ""
+
+    with ASR_PREP_LOCK:
+        if os.path.isdir(normalized):
+            return True, ""
+        if normalized in ASR_PREPARED_PATHS:
+            return False, f"ASR path '{normalized}' vẫn chưa sẵn sàng sau lần chuẩn bị trước."
+        ASR_PREPARED_PATHS.add(normalized)
+
+        source_model = os.getenv("PHOWHISPER_SOURCE_MODEL", "vinai/PhoWhisper-small").strip()
+        quantization = os.getenv("PHOWHISPER_CT2_QUANTIZATION", "int8_float16").strip()
+        script_path = os.path.join(os.path.dirname(__file__), "scripts", "convert_phowhisper_ct2.sh")
+        os.makedirs(os.path.dirname(normalized) or ".", exist_ok=True)
+
+        if os.path.isfile(script_path):
+            cmd = ["bash", script_path, source_model, normalized, quantization]
+        else:
+            cmd = [
+                "ct2-transformers-converter",
+                "--model",
+                source_model,
+                "--output_dir",
+                normalized,
+                "--copy_files",
+                "tokenizer.json",
+                "preprocessor_config.json",
+                "--quantization",
+                quantization,
+            ]
+        print(f"[INFO] Auto-prepare ASR model: {' '.join(cmd)}")
+        proc = subprocess.run(cmd, text=True, capture_output=True)
+        if proc.returncode != 0:
+            err_tail = (proc.stderr or proc.stdout or "").strip()[-600:]
+            return False, f"Auto-convert ASR thất bại (code={proc.returncode}). {err_tail}"
+        if os.path.isdir(normalized):
+            return True, ""
+        return False, f"Auto-convert hoàn tất nhưng không thấy thư mục '{normalized}'."
+
+
+def _resolve_asr_model_path(model_path: str) -> tuple[str, str]:
+    requested = (model_path or "").strip()
+    if not requested:
+        return "small", "ASR path trống, fallback sang model 'small'."
+    if os.path.isdir(requested):
+        return requested, ""
+    if os.path.sep in requested:
+        try:
+            ok, prep_msg = _try_prepare_ct2_model(requested)
+        except Exception as exc:
+            ok = False
+            prep_msg = f"Auto-convert ASR lỗi: {type(exc).__name__}"
+        if ok and os.path.isdir(requested):
+            return requested, ""
+        fallback_model = os.getenv("ASR_FALLBACK_MODEL", "small").strip() or "small"
+        if prep_msg:
+            msg = (
+                f"{prep_msg} Fallback sang '{fallback_model}'. "
+                "Bạn có thể tự convert bằng ./scripts/convert_phowhisper_ct2.sh."
+            )
+            return fallback_model, msg
+        return fallback_model, f"ASR path '{requested}' không tồn tại, fallback sang '{fallback_model}'."
+    return requested, ""
+
+
+def _get_vieneu_engine_and_voice(
+    backbone_repo: str,
+    backbone_device: str,
+    codec_repo: str,
+    codec_device: str,
+    voice_id: str,
+) -> tuple[Any, Any]:
+    key = (
+        backbone_repo.strip(),
+        backbone_device.strip(),
+        codec_repo.strip(),
+        codec_device.strip(),
+        voice_id.strip(),
+    )
+    with TTS_LOCK:
+        if key in TTS_CACHE:
+            return TTS_CACHE[key]
+        try:
+            from vieneu import Vieneu  # type: ignore
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "Thiếu package 'vieneu'. Cài thêm: "
+                "pip install vieneu --extra-index-url "
+                "https://pnnbao97.github.io/llama-cpp-python-v0.3.16/cpu/"
+            ) from exc
+
+        engine = Vieneu(
+            backbone_repo=key[0],
+            backbone_device=key[1] or "cpu",
+            codec_repo=key[2],
+            codec_device=key[3] or "cpu",
+        )
+        voice = None
+        if key[4]:
+            try:
+                voice = engine.get_preset_voice(key[4])
+            except Exception:
+                voice = None
+        if voice is None:
+            try:
+                voice = engine.get_preset_voice(None)
+            except Exception:
+                voice = None
+        TTS_CACHE[key] = (engine, voice)
+        return engine, voice
+
+
+def _synthesize_vieneu_audio(
+    text: str,
+    backbone_repo: str,
+    backbone_device: str,
+    codec_repo: str,
+    codec_device: str,
+    voice_id: str,
+) -> tuple[int, Any]:
+    if not text.strip():
+        raise RuntimeError("Không có nội dung để TTS.")
+    try:
+        import numpy as np  # type: ignore
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("Thiếu package 'numpy'.") from exc
+
+    engine, voice = _get_vieneu_engine_and_voice(
+        backbone_repo=backbone_repo,
+        backbone_device=backbone_device,
+        codec_repo=codec_repo,
+        codec_device=codec_device,
+        voice_id=voice_id,
+    )
+    kwargs: dict[str, Any] = {"text": text}
+    if voice is not None:
+        kwargs["voice"] = voice
+    audio = engine.infer(**kwargs)
+    arr = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if arr.size == 0:
+        raise RuntimeError("VieNeu trả về audio rỗng.")
+    arr = np.clip(arr, -1.0, 1.0)
+    sample_rate = int(getattr(engine, "sample_rate", 24000))
+    return sample_rate, arr
 
 
 def _append_chat_history(
@@ -275,7 +438,11 @@ def _chat_once(
 
 
 def _get_asr_model(settings: ASRSettings) -> Any:
-    key = (settings.model_path, settings.device, settings.compute_type)
+    resolved_model_path, resolve_msg = _resolve_asr_model_path(settings.model_path)
+    if resolve_msg:
+        print(f"[WARN] {resolve_msg}")
+
+    key = (resolved_model_path, settings.device, settings.compute_type)
     if key in ASR_CACHE:
         return ASR_CACHE[key]
 
@@ -286,11 +453,20 @@ def _get_asr_model(settings: ASRSettings) -> Any:
             "Missing dependency 'faster-whisper'. Install requirements-gradio.txt."
         ) from exc
 
-    model = WhisperModel(
-        settings.model_path,
-        device=settings.device,
-        compute_type=settings.compute_type,
-    )
+    try:
+        model = WhisperModel(
+            resolved_model_path,
+            device=settings.device,
+            compute_type=settings.compute_type,
+        )
+    except Exception as exc:
+        guidance = (
+            "ASR model không tải được. Nếu dùng PhoWhisper local, hãy convert trước bằng "
+            "`./scripts/convert_phowhisper_ct2.sh` rồi đặt đúng `ASR Model Path`. "
+            "Hoặc đặt tạm `ASR Model Path = small` để demo nhanh."
+        )
+        raise RuntimeError(f"{guidance} (model='{resolved_model_path}')") from exc
+
     ASR_CACHE[key] = model
     return model
 
@@ -335,7 +511,8 @@ def _transcribe_audio(
             return "", "ASR hoàn tất nhưng không nhận được nội dung."
         return text, "ASR hoàn tất."
     except Exception as exc:
-        return "", f"ASR lỗi: {type(exc).__name__}"
+        err = str(exc).strip().replace("\n", " ")
+        return "", f"ASR lỗi: {type(exc).__name__}. {err[:220]}"
 
 
 def _resample_audio(audio: Any, source_sr: int, target_sr: int) -> Any:
@@ -442,15 +619,22 @@ def _realtime_stream_step(
     realtime_rms_threshold: float,
     realtime_min_speech_ms: int,
     realtime_endpoint_silence_ms: int,
-) -> tuple[dict[str, Any], list[Any], list[dict[str, str]], dict, str, str]:
+    tts_enabled: bool,
+    tts_backbone_repo: str,
+    tts_backbone_device: str,
+    tts_codec_repo: str,
+    tts_codec_device: str,
+    tts_voice_id: str,
+) -> tuple[dict[str, Any], list[Any], list[dict[str, str]], dict, str, str, Any]:
     history = list(chat_history or [])
     messages = list(llm_messages or [])
     state = dict(tool_state or {})
     rt = dict(realtime_state or _new_realtime_state())
+    bot_audio: Any = None
 
     if not realtime_enabled:
         rt["detector"] = None
-        return rt, history, messages, state, "", "Realtime mic đang tắt."
+        return rt, history, messages, state, "", "Realtime mic đang tắt.", bot_audio
 
     cfg = RealtimeConfig(
         sample_rate=16000,
@@ -474,7 +658,7 @@ def _realtime_stream_step(
 
     pcm_chunk = _chunk_to_pcm16(audio_chunk, target_sr=cfg.sample_rate)
     if not pcm_chunk:
-        return rt, history, messages, state, "", "Đang nghe realtime..."
+        return rt, history, messages, state, "", "Đang nghe realtime...", bot_audio
 
     asr_settings = ASRSettings(
         model_path=asr_model_path,
@@ -488,12 +672,24 @@ def _realtime_stream_step(
 
     final_utterances = detector.feed(pcm_chunk)
     if not final_utterances:
-        return rt, history, messages, state, "", "Đang nghe realtime..."
+        return rt, history, messages, state, "", "Đang nghe realtime...", bot_audio
 
     latest_transcript = ""
     latest_status = "Đang nghe realtime..."
     for utterance in final_utterances:
-        user_text = _transcribe_pcm16(utterance, asr_settings).strip()
+        try:
+            user_text = _transcribe_pcm16(utterance, asr_settings).strip()
+        except Exception as exc:
+            err = str(exc).strip().replace("\n", " ")
+            return (
+                rt,
+                history,
+                messages,
+                state,
+                "",
+                f"ASR realtime lỗi: {type(exc).__name__}. {err[:220]}",
+                bot_audio,
+            )
         if not user_text:
             continue
         latest_transcript = user_text
@@ -511,14 +707,40 @@ def _realtime_stream_step(
             top_p=top_p,
             max_tokens=int(max_tokens),
         )
+        if tts_enabled:
+            assistant_text = ""
+            if messages and messages[-1].get("role") == "assistant":
+                assistant_text = messages[-1].get("content", "")
+            if assistant_text:
+                try:
+                    bot_audio = _synthesize_vieneu_audio(
+                        text=assistant_text,
+                        backbone_repo=tts_backbone_repo,
+                        backbone_device=tts_backbone_device,
+                        codec_repo=tts_codec_repo,
+                        codec_device=tts_codec_device,
+                        voice_id=tts_voice_id,
+                    )
+                except Exception as exc:
+                    latest_status = f"{latest_status} | TTS lỗi: {type(exc).__name__}"
+                    bot_audio = None
 
     if latest_transcript:
-        return rt, history, messages, state, latest_transcript, latest_status
-    return rt, history, messages, state, "", "ASR realtime chưa nhận được câu rõ ràng."
+        return rt, history, messages, state, latest_transcript, latest_status, bot_audio
+    return rt, history, messages, state, "", "ASR realtime chưa nhận được câu rõ ràng.", bot_audio
 
 
-def _reset_conversation() -> tuple[list[Any], list[dict[str, str]], dict, str, str, dict[str, Any], str]:
-    return [], [], {}, "", "Đã xóa lịch sử hội thoại.", _new_realtime_state(), ""
+def _reset_conversation() -> tuple[
+    list[Any],
+    list[dict[str, str]],
+    dict,
+    str,
+    str,
+    dict[str, Any],
+    str,
+    Any,
+]:
+    return [], [], {}, "", "Đã xóa lịch sử hội thoại.", _new_realtime_state(), "", None
 
 
 def build_ui() -> gr.Blocks:
@@ -539,7 +761,7 @@ def build_ui() -> gr.Blocks:
         )
 
         status = gr.Textbox(label="Trạng thái", value="Sẵn sàng.", interactive=False)
-        chatbot_kwargs: dict[str, Any] = {"label": "Hội thoại", "height": 420}
+        chatbot_kwargs: dict[str, Any] = {"label": "Hội thoại", "height": 420, "allow_tags": False}
         if CHATBOT_SUPPORTS_TYPE:
             chatbot_kwargs["type"] = "messages"
         chat_history = gr.Chatbot(**chatbot_kwargs)
@@ -655,6 +877,48 @@ def build_ui() -> gr.Blocks:
                     lines=2,
                     interactive=False,
                 )
+                gr.Markdown("### Realtime bot voice")
+                realtime_tts_enabled = gr.Checkbox(
+                    label="Bật bot trả lời bằng giọng nói",
+                    value=VIENEU_AVAILABLE,
+                    info=(
+                        "Dùng VieNeu-TTS để phát audio bot ngay trong trình duyệt."
+                        if VIENEU_AVAILABLE
+                        else "Chưa có package vieneu. Cài thêm rồi bật checkbox này."
+                    ),
+                )
+                with gr.Row():
+                    realtime_tts_backbone_repo = gr.Textbox(
+                        label="TTS Backbone Repo",
+                        value="pnnbao-ump/VieNeu-TTS-0.3B-q4-gguf",
+                    )
+                    realtime_tts_backbone_device = gr.Dropdown(
+                        label="TTS Backbone Device",
+                        choices=["cpu", "cuda", "mps"],
+                        value="cpu",
+                    )
+                with gr.Row():
+                    realtime_tts_codec_repo = gr.Textbox(
+                        label="TTS Codec Repo",
+                        value="neuphonic/distill-neucodec",
+                    )
+                    realtime_tts_codec_device = gr.Dropdown(
+                        label="TTS Codec Device",
+                        choices=["cpu", "cuda", "mps"],
+                        value="cpu",
+                    )
+                    realtime_tts_voice_id = gr.Textbox(
+                        label="TTS Voice ID (optional)",
+                        value="",
+                    )
+                bot_audio_kwargs: dict[str, Any] = {
+                    "label": "Audio bot realtime",
+                    "type": "numpy",
+                    "interactive": False,
+                }
+                if AUDIO_SUPPORTS_AUTOPLAY:
+                    bot_audio_kwargs["autoplay"] = True
+                realtime_bot_audio = gr.Audio(**bot_audio_kwargs)
 
         common_inputs = [
             chat_history,
@@ -728,6 +992,12 @@ def build_ui() -> gr.Blocks:
                 realtime_rms_threshold,
                 realtime_min_speech_ms,
                 realtime_endpoint_silence_ms,
+                realtime_tts_enabled,
+                realtime_tts_backbone_repo,
+                realtime_tts_backbone_device,
+                realtime_tts_codec_repo,
+                realtime_tts_codec_device,
+                realtime_tts_voice_id,
             ],
             outputs=[
                 realtime_state,
@@ -736,6 +1006,7 @@ def build_ui() -> gr.Blocks:
                 tool_state,
                 realtime_transcript,
                 status,
+                realtime_bot_audio,
             ],
         )
 
@@ -750,6 +1021,7 @@ def build_ui() -> gr.Blocks:
                 status,
                 realtime_state,
                 realtime_transcript,
+                realtime_bot_audio,
             ],
         )
 

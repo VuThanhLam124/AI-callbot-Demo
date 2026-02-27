@@ -216,6 +216,7 @@ Tính năng:
 - Text chat với vLLM (OpenAI-compatible API).
 - Voice input (microphone/upload) -> ASR PhoWhisper -> gửi vào chatbot.
 - Realtime voice trong browser: bật `Bật realtime voice`, bot tự gửi khi bạn dừng nói.
+- Bot có thể phát lại audio trả lời realtime ngay trong Gradio (VieNeu-TTS).
 - Có fallback rule-based nếu vLLM chưa sẵn sàng.
 - Request tới vLLM có `enable_thinking=false` để giảm độ trễ.
 - Có tool-system dùng `sample_data` để bot trả lời logic hơn cho các tác vụ:
@@ -239,5 +240,34 @@ Nếu vLLM đang chạy cổng 8002:
 !pip install -r requirements-gradio.txt
 !python app_gradio.py --host 0.0.0.0 --port 7860
 ```
+
+Lưu ý quan trọng cho ASR trên Kaggle:
+- `ASR Model Path` mặc định là `models/PhoWhisper-small-ct2` (local path).
+- Nếu path này chưa tồn tại, app sẽ tự thử convert `vinai/PhoWhisper-small` sang CT2.
+- Nếu auto-convert thất bại, app fallback sang model `small` để demo nhanh.
+
+Muốn dùng đúng PhoWhisper (khuyến nghị), convert trước:
+
+```python
+!chmod +x scripts/convert_phowhisper_ct2.sh
+!./scripts/convert_phowhisper_ct2.sh vinai/PhoWhisper-small models/PhoWhisper-small-ct2 int8_float16
+!ASR_MODEL_PATH=models/PhoWhisper-small-ct2 python app_gradio.py --host 0.0.0.0 --port 7860 --share
+```
+
+Nếu chỉ cần chạy nhanh:
+
+```python
+!ASR_MODEL_PATH=small python app_gradio.py --host 0.0.0.0 --port 7860 --share
+```
+
+Nếu muốn bot trả lời bằng giọng nói realtime trong Gradio:
+
+```python
+!pip install vieneu --extra-index-url https://pnnbao97.github.io/llama-cpp-python-v0.3.16/cpu/
+```
+
+Sau đó vào tab `Nhập giọng nói`:
+- Bật `Bật realtime voice`.
+- Bật `Bật bot trả lời bằng giọng nói`.
 
 Nếu bạn chưa dựng vLLM trên Kaggle, bỏ check `Dùng vLLM` trong UI để test fallback flow.
