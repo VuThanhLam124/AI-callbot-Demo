@@ -59,24 +59,24 @@ def recommend_plans(request: RecommendPlanRequest) -> list[RecommendPlanResult]:
 
         if request.priority == "data":
             score += plan["data_gb_per_day"] * 2
-            reasons.append(f"{plan['data_gb_per_day']}GB/ngay")
+            reasons.append(f"{plan['data_gb_per_day']}GB/ngày")
         elif request.priority == "call":
             score += plan["call_minutes_onnet"] / 100
-            reasons.append(f"{plan['call_minutes_onnet']} phut noi mang")
+            reasons.append(f"{plan['call_minutes_onnet']} phút nội mạng")
         else:
             score += (request.budget_max_vnd - plan["monthly_price_vnd"]) / 100000
-            reasons.append(f"Gia {plan['monthly_price_vnd']:,} VND/thang")
+            reasons.append(f"Giá {plan['monthly_price_vnd']:,} VND/tháng")
 
         if subscriber:
             if plan["data_gb_per_day"] >= subscriber["avg_data_usage_gb_per_day"]:
                 score += 2
-                reasons.append("Phu hop muc dung data hien tai")
+                reasons.append("Phù hợp mức dùng data hiện tại")
             if (
                 plan["call_minutes_onnet"]
                 >= subscriber["avg_call_minutes_per_month"] * 0.5
             ):
                 score += 1
-                reasons.append("Du phut goi noi mang")
+                reasons.append("Đủ phút gọi nội mạng")
 
         if plan["is_5g"]:
             score += 0.5

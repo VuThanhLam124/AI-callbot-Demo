@@ -36,14 +36,14 @@ def main() -> None:
     bot = TelecomCallbot(mode=args.mode, phone=args.phone)
 
     print(f"[BOT] {bot.opening()}")
-    print("[INFO] Nhap 'exit' de ket thuc.")
+    print("[INFO] Nhập 'exit' để kết thúc.")
 
     while True:
         user_text = input("[USER] ").strip()
         if not user_text:
             continue
         if user_text.lower() in {"exit", "quit", "q"}:
-            print("[BOT] Ket thuc cuoc goi demo. Cam on anh/chị.")
+            print("[BOT] Kết thúc cuộc gọi demo. Cảm ơn anh/chị.")
             break
 
         print(f"[BOT] {bot.reply(user_text)}")

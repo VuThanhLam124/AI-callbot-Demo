@@ -42,23 +42,23 @@ PLANS = [
 SIM_OFFERS = [
     {
         "id": "SIM_VIP_01",
-        "name": "SIM So Dep Than Tai",
+        "name": "SIM Số Đẹp Thần Tài",
         "sim_price_vnd": 199000,
-        "bundle": "Tang 3 thang goi VP_MAX_6GB",
+        "bundle": "Tặng 3 tháng gói VP_MAX_6GB",
         "target_segments": ["kinh_doanh", "pho_thong"],
     },
     {
         "id": "SIM_STUDENT_02",
-        "name": "SIM Sinh Vien",
+        "name": "SIM Sinh Viên",
         "sim_price_vnd": 49000,
-        "bundle": "Mien phi 2GB/ngay trong 30 ngay dau",
+        "bundle": "Miễn phí 2GB/ngày trong 30 ngày đầu",
         "target_segments": ["sinh_vien"],
     },
     {
         "id": "SIM_FAMILY_03",
-        "name": "SIM Gia Dinh",
+        "name": "SIM Gia Đình",
         "sim_price_vnd": 99000,
-        "bundle": "Mien phi 500 phut noi mang trong 2 thang",
+        "bundle": "Miễn phí 500 phút nội mạng trong 2 tháng",
         "target_segments": ["gia_dinh"],
     },
 ]
@@ -66,21 +66,21 @@ SIM_OFFERS = [
 SUBSCRIBERS = {
     "0987000001": {
         "phone": "0987000001",
-        "name": "Nguyen Van A",
+        "name": "Nguyễn Văn A",
         "current_plan_id": "VP_ECO_2GB",
         "avg_data_usage_gb_per_day": 3.1,
         "avg_call_minutes_per_month": 80,
     },
     "0987000002": {
         "phone": "0987000002",
-        "name": "Tran Thi B",
+        "name": "Trần Thị B",
         "current_plan_id": "VP_MAX_6GB",
         "avg_data_usage_gb_per_day": 4.5,
         "avg_call_minutes_per_month": 140,
     },
     "0987000003": {
         "phone": "0987000003",
-        "name": "Le Minh C",
+        "name": "Lê Minh C",
         "current_plan_id": "VP_FAMILY_4GB",
         "avg_data_usage_gb_per_day": 2.0,
         "avg_call_minutes_per_month": 620,

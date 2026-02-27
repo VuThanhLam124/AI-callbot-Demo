@@ -36,9 +36,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--asr-no-speech-threshold", type=float, default=0.6)
     parser.add_argument("--asr-log-prob-threshold", type=float, default=-1.0)
 
-    parser.add_argument("--vllm-base-url", default="http://localhost:8000/v1")
+    parser.add_argument("--vllm-base-url", default="http://localhost:8002/v1")
     parser.add_argument("--vllm-model", default="Qwen/Qwen3-1.7B-GPTQ-Int8")
     parser.add_argument("--vllm-api-key", default="dummy")
+    parser.add_argument("--phone", default="0987000001")
+    parser.add_argument(
+        "--disable-tools",
+        action="store_true",
+        help="Disable tool-system and force pure LLM responses",
+    )
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.8)
     parser.add_argument("--max-tokens", type=int, default=160)
@@ -69,17 +75,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--system-prompt",
         default=(
-            "You are VNPost Telecom voice assistant. "
-            "Answer in concise Vietnamese. "
-            "Focus on SIM offers and telecom package lookup. "
-            "If user asks outside telecom scope, politely redirect."
+            "Bạn là trợ lý giọng nói VNPost Telecom. "
+            "Luôn trả lời tiếng Việt có dấu, ngắn gọn. "
+            "Tập trung vào ưu đãi SIM và tra cứu gói cước viễn thông. "
+            "Nếu người dùng hỏi ngoài phạm vi, hãy điều hướng lịch sự."
         ),
     )
     parser.add_argument(
         "--greeting",
         default=(
-            "Xin chao, day la tro ly AI VNPost Telecom. "
-            "Toi co the ho tro tra cuu goi cuoc hoac tu van mua SIM."
+            "Xin chào, đây là trợ lý AI VNPost Telecom. "
+            "Tôi có thể hỗ trợ tra cứu gói cước hoặc tư vấn mua SIM."
         ),
     )
     return parser
@@ -124,6 +130,8 @@ def main() -> None:
         audio_cfg=cfg,
         system_prompt=args.system_prompt,
         greeting=args.greeting,
+        phone=args.phone,
+        use_tools=not args.disable_tools,
         barge_in_frames=barge_in_frames,
         barge_in_min_bot_ms=args.barge_in_min_bot_ms,
         barge_in_enabled=not args.disable_barge_in,

@@ -95,13 +95,14 @@ vllm serve Qwen/Qwen3-1.7B-GPTQ-Int8 \
 
 ## 6) Realtime pipeline (PhoWhisper + vLLM + barge-in)
 
-Muc tieu:
-- ASR: `vinai/PhoWhisper-small` da convert sang CTranslate2.
+Mục tiêu:
+- ASR: `vinai/PhoWhisper-small` đã convert sang CTranslate2.
 - LLM: `Qwen/Qwen3-1.7B-GPTQ-Int8` qua vLLM.
-- Hanh vi latency-thap cho callbot: `enable_thinking=false`.
-- Ho tro `barge-in`: khach chen loi thi bot dung phat TTS ngay.
+- Hành vi latency thấp cho callbot: `enable_thinking=false`.
+- Hỗ trợ `barge-in`: khách chen lời thì bot dừng phát TTS ngay.
+- Tích hợp `tool-system` để dùng sample data (tra cứu thuê bao, gợi ý gói, ưu đãi SIM...).
 
-### Cai dependency cho realtime
+### Cài dependency cho realtime
 
 ```bash
 pip install -r requirements-realtime.txt
@@ -113,7 +114,7 @@ pip install -r requirements-realtime.txt
 ./scripts/convert_phowhisper_ct2.sh
 ```
 
-Hoac command tay:
+Hoặc command tay:
 
 ```bash
 ct2-transformers-converter \
@@ -123,7 +124,18 @@ ct2-transformers-converter \
   --quantization int8_float16
 ```
 
-### Chay vLLM server
+### Chạy vLLM server (VRAM 6GB khuyến nghị)
+
+```bash
+vllm serve Qwen/Qwen3-1.7B-GPTQ-Int8 \
+  --host 0.0.0.0 --port 8002 \
+  --dtype half \
+  --max-model-len 1024 \
+  --max-num-seqs 1 \
+  --gpu-memory-utilization 0.75
+```
+
+### Chạy realtime callbot
 
 ```bash
 python scripts/realtime_callbot.py \
@@ -136,57 +148,44 @@ python scripts/realtime_callbot.py \
   --barge-in-ms 320 \
   --utterance-min-rms 0.012
 
-
 ```
 
-### Chay realtime callbot
-
-```bash
-python scripts/realtime_callbot.py \
-  --asr-model-path models/PhoWhisper-small-ct2 \
-  --vllm-base-url http://localhost:8002/v1 \
-  --vllm-model Qwen/Qwen3-1.7B-GPTQ-Int8 \
-  --tts-mode text \
-  --vad-aggressiveness 3 \
-  --min-speech-ms 260 \
-  --endpoint-silence-ms 550 \
-  --barge-in-ms 320
-```
-
-Neu muon phat am thanh local:
+Nếu muốn phát âm thanh local:
 
 ```bash
 python scripts/realtime_callbot.py --tts-mode pyttsx3
 ```
 
 Note:
-- `barge-in` mac dinh 320ms speech lien tuc de ngat bot (`--barge-in-ms`).
-- `enable_thinking=false` da duoc hard-code trong `app/realtime_pipeline.py` khi goi vLLM OpenAI API.
-- De tranh echo lam false-barge-in khi demo local, nen dung tai nghe.
-- Neu moi truong nhieu tap am thanh, thu `--disable-barge-in` hoac tang `--barge-in-ms`.
-- Neu ASR nhay cau vo nghia, tang nguong `--utterance-min-rms` len `0.012` -> `0.02`.
+- `barge-in` mặc định 320ms speech liên tục để ngắt bot (`--barge-in-ms`).
+- `enable_thinking=false` đã được hard-code trong `app/realtime_pipeline.py` khi gọi vLLM OpenAI API.
+- Để tránh echo làm false-barge-in khi demo local, nên dùng tai nghe.
+- Nếu môi trường nhiều tạp âm thanh, thử `--disable-barge-in` hoặc tăng `--barge-in-ms`.
+- Nếu ASR nhảy câu vô nghĩa, tăng ngưỡng `--utterance-min-rms` lên `0.012` -> `0.02`.
 
 ## 7) Gradio UI (Kaggle friendly)
 
-File chay web UI: `app_gradio.py`
+File chạy web UI: `app_gradio.py`
 
-Tinh nang:
-- Text chat voi vLLM (OpenAI-compatible API).
-- Voice input (microphone/upload) -> ASR PhoWhisper -> send vao chatbot.
-- Co fallback rule-based neu vLLM chua san sang.
-- Request toi vLLM co `enable_thinking=false` de giam do tre.
+Tính năng:
+- Text chat với vLLM (OpenAI-compatible API).
+- Voice input (microphone/upload) -> ASR PhoWhisper -> gửi vào chatbot.
+- Có fallback rule-based nếu vLLM chưa sẵn sàng.
+- Request tới vLLM có `enable_thinking=false` để giảm độ trễ.
+- Có tool-system dùng `sample_data` để bot trả lời logic hơn cho các tác vụ:
+  tra cứu thuê bao, danh sách gói cước, ưu đãi SIM, gợi ý gói, tạo lead và lịch gọi lại.
 
-### Chay local
+### Chạy local
 
 ```bash
 pip install -r requirements-gradio.txt
 python app_gradio.py --host 0.0.0.0 --port 7860
 ```
 
-Neu vLLM dang chay cong 8002:
+Nếu vLLM đang chạy cổng 8002:
 - Set `vLLM Base URL` trong UI: `http://localhost:8002/v1`
 
-### Chay tren Kaggle notebook
+### Chạy trên Kaggle notebook
 
 ```python
 !git clone https://github.com/VuThanhLam124/AI-callbot-Demo.git
@@ -195,4 +194,4 @@ Neu vLLM dang chay cong 8002:
 !python app_gradio.py --host 0.0.0.0 --port 7860
 ```
 
-Neu ban chua dung vLLM tren Kaggle, bo check `Use vLLM` trong UI de test fallback flow.
+Nếu bạn chưa dựng vLLM trên Kaggle, bỏ check `Dùng vLLM` trong UI để test fallback flow.

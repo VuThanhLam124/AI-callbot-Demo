@@ -9,6 +9,8 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from app.tool_system import TelecomToolSystem
+
 
 def _pcm16_rms(pcm16_bytes: bytes) -> float:
     if not pcm16_bytes:
@@ -305,6 +307,8 @@ class RealtimeCallbot:
         audio_cfg: AudioConfig,
         system_prompt: str,
         greeting: str,
+        phone: str = "0987000001",
+        use_tools: bool = True,
         barge_in_frames: int = 8,
         barge_in_min_bot_ms: int = 250,
         barge_in_enabled: bool = True,
@@ -316,6 +320,8 @@ class RealtimeCallbot:
         self.vad = StreamingVAD(audio_cfg)
         self.system_prompt = system_prompt
         self.greeting = greeting
+        self.phone = phone
+        self.use_tools = use_tools
         self.barge_in_frames = max(1, barge_in_frames)
         self.barge_in_min_bot_ms = max(0, barge_in_min_bot_ms)
         self.barge_in_enabled = barge_in_enabled
@@ -323,6 +329,8 @@ class RealtimeCallbot:
         self.stop_event = threading.Event()
         self.audio_q: queue.Queue[bytes] = queue.Queue(maxsize=300)
         self.messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+        self.tool_system = TelecomToolSystem()
+        self.tool_state: dict[str, Any] = {}
 
     def _on_audio_frame(self, indata: bytes) -> None:
         try:
@@ -400,7 +408,7 @@ class RealtimeCallbot:
             self.speech_during_tts = 0
 
         if self.speech_during_tts >= self.barge_in_frames:
-            print("[BARGE-IN] User interrupted bot speech.")
+            print("[BARGE-IN] Người dùng chen lời, dừng TTS.")
             self.tts.stop()
             self.speech_during_tts = 0
 
@@ -415,16 +423,28 @@ class RealtimeCallbot:
         print(f"[USER] {user_text}")
         self.messages.append({"role": "user", "content": user_text})
 
-        try:
-            assistant_text = self.llm.chat(self.messages).strip()
-        except Exception as exc:
-            assistant_text = (
-                "Xin loi, toi dang gap loi ket noi AI server. "
-                f"Chi tiet: {type(exc).__name__}"
+        assistant_text = ""
+        if self.use_tools:
+            handled, tool_reply, self.tool_state, tool_name = self.tool_system.handle(
+                user_text,
+                self.phone,
+                self.tool_state,
             )
+            if handled:
+                assistant_text = tool_reply
+                print(f"[TOOL] Đã xử lý bằng tool: {tool_name}")
 
         if not assistant_text:
-            assistant_text = "Xin loi, toi chua nghe ro. Ban co the noi lai giup toi khong?"
+            try:
+                assistant_text = self.llm.chat(self.messages).strip()
+            except Exception as exc:
+                assistant_text = (
+                    "Xin lỗi, tôi đang gặp lỗi kết nối AI server. "
+                    f"Chi tiết: {type(exc).__name__}"
+                )
+
+        if not assistant_text:
+            assistant_text = "Xin lỗi, tôi chưa nghe rõ. Bạn có thể nói lại giúp tôi không?"
 
         self.messages.append({"role": "assistant", "content": assistant_text})
         self.tts.speak_async(assistant_text)

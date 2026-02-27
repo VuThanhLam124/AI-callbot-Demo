@@ -11,6 +11,7 @@ from typing import Any
 import requests
 
 from app.callbot import TelecomCallbot
+from app.tool_system import TelecomToolSystem
 
 try:
     import gradio as gr
@@ -32,6 +33,7 @@ class ASRSettings:
 
 
 ASR_CACHE: dict[tuple[str, str, str], Any] = {}
+TOOL_SYSTEM = TelecomToolSystem()
 
 
 def _normalize_vllm_base_url(base_url: str) -> str:
@@ -61,7 +63,7 @@ def _call_vllm(
         "top_p": top_p,
         "max_tokens": max_tokens,
         # Keep latency low for callbot behavior.
-        "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     resp = requests.post(endpoint, json=payload, timeout=60)
     resp.raise_for_status()
@@ -93,6 +95,7 @@ def _chat_once(
     user_text: str,
     chat_history: list[dict[str, str]] | None,
     llm_messages: list[dict[str, str]] | None,
+    tool_state: dict | None,
     base_url: str,
     model: str,
     system_prompt: str,
@@ -101,40 +104,46 @@ def _chat_once(
     temperature: float,
     top_p: float,
     max_tokens: int,
-) -> tuple[str, list[dict[str, str]], list[dict[str, str]], str]:
+) -> tuple[str, list[dict[str, str]], list[dict[str, str]], dict, str]:
     text = (user_text or "").strip()
     history = list(chat_history or [])
     messages = _ensure_system_message(list(llm_messages or []), system_prompt)
+    state = dict(tool_state or {})
 
     if not text:
-        return "", history, messages, "Please type or transcribe a message first."
+        return "", history, messages, state, "Vui lòng nhập hoặc chuyển giọng nói thành văn bản trước."
 
     history.append({"role": "user", "content": text})
     messages.append({"role": "user", "content": text})
 
-    status = "Rule-based fallback mode."
-    if use_vllm:
-        try:
-            assistant = _call_vllm(
-                base_url=base_url,
-                model=model,
-                messages=messages,
-                temperature=temperature,
-                top_p=top_p,
-                max_tokens=max_tokens,
-            )
-            if not assistant:
-                assistant = "Xin loi, toi chua nghe ro. Ban co the noi lai giup toi khong?"
-            status = "vLLM response OK (enable_thinking=false)."
-        except Exception as exc:
-            assistant = _fallback_reply(text, phone)
-            status = f"vLLM unavailable -> fallback ({type(exc).__name__})."
+    handled, tool_reply, state, tool_name = TOOL_SYSTEM.handle(text, phone, state)
+    if handled:
+        assistant = tool_reply
+        status = f"Đã xử lý bằng tool: {tool_name}"
     else:
-        assistant = _fallback_reply(text, phone)
+        status = "Đang dùng fallback rule-based."
+        if use_vllm:
+            try:
+                assistant = _call_vllm(
+                    base_url=base_url,
+                    model=model,
+                    messages=messages,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_tokens=max_tokens,
+                )
+                if not assistant:
+                    assistant = "Xin lỗi, tôi chưa nghe rõ. Bạn có thể nói lại giúp tôi không?"
+                status = "vLLM phản hồi thành công (enable_thinking=false)."
+            except Exception as exc:
+                assistant = _fallback_reply(text, phone)
+                status = f"vLLM không khả dụng, chuyển fallback ({type(exc).__name__})."
+        else:
+            assistant = _fallback_reply(text, phone)
 
     history.append({"role": "assistant", "content": assistant})
     messages.append({"role": "assistant", "content": assistant})
-    return "", history, messages, status
+    return "", history, messages, state, status
 
 
 def _get_asr_model(settings: ASRSettings) -> Any:
@@ -169,7 +178,7 @@ def _transcribe_audio(
     asr_log_prob_threshold: float,
 ) -> tuple[str, str]:
     if not audio_path:
-        return "", "No audio input."
+        return "", "Không có audio đầu vào."
 
     settings = ASRSettings(
         model_path=asr_model_path,
@@ -195,14 +204,14 @@ def _transcribe_audio(
         )
         text = " ".join(seg.text.strip() for seg in segments).strip()
         if not text:
-            return "", "ASR complete: empty transcript."
-        return text, "ASR complete."
+            return "", "ASR hoàn tất nhưng không nhận được nội dung."
+        return text, "ASR hoàn tất."
     except Exception as exc:
-        return "", f"ASR failed: {type(exc).__name__}"
+        return "", f"ASR lỗi: {type(exc).__name__}"
 
 
-def _reset_conversation() -> tuple[list[dict[str, str]], list[dict[str, str]], str, str]:
-    return [], [], "", "Conversation cleared."
+def _reset_conversation() -> tuple[list[dict[str, str]], list[dict[str, str]], dict, str, str]:
+    return [], [], {}, "", "Đã xóa lịch sử hội thoại."
 
 
 def build_ui() -> gr.Blocks:
@@ -214,24 +223,26 @@ def build_ui() -> gr.Blocks:
         gr.Markdown(
             """
             # VNPost Telecom Callbot (Gradio)
-            Text + voice demo with:
+            Demo văn bản + giọng nói với:
             - ASR: PhoWhisper-small (CTranslate2 via faster-whisper)
             - LLM: vLLM OpenAI-compatible API
-            - Chat request sets `enable_thinking=false`
+            - Yêu cầu chat luôn dùng `enable_thinking=false`
+            - Có tool system bám theo sample data để trả lời logic hơn
             """
         )
 
-        status = gr.Textbox(label="Runtime Status", value="Ready.", interactive=False)
-        chat_history = gr.Chatbot(label="Conversation", type="messages", height=420)
+        status = gr.Textbox(label="Trạng thái", value="Sẵn sàng.", interactive=False)
+        chat_history = gr.Chatbot(label="Hội thoại", type="messages", height=420)
         llm_state = gr.State([])
+        tool_state = gr.State({})
 
-        with gr.Accordion("Runtime Settings", open=False):
+        with gr.Accordion("Cấu hình runtime", open=False):
             with gr.Row():
                 base_url = gr.Textbox(label="vLLM Base URL", value=default_base_url)
                 model_name = gr.Textbox(label="vLLM Model", value=default_model)
             with gr.Row():
-                use_vllm = gr.Checkbox(label="Use vLLM", value=True)
-                phone = gr.Textbox(label="Demo Subscriber Phone", value="0987000001")
+                use_vllm = gr.Checkbox(label="Dùng vLLM", value=True)
+                phone = gr.Textbox(label="Số thuê bao demo", value="0987000001")
             with gr.Row():
                 temperature = gr.Slider(0.0, 1.5, value=0.7, step=0.05, label="Temperature")
                 top_p = gr.Slider(0.1, 1.0, value=0.8, step=0.05, label="Top P")
@@ -239,9 +250,9 @@ def build_ui() -> gr.Blocks:
             system_prompt = gr.Textbox(
                 label="System Prompt",
                 value=(
-                    "You are VNPost Telecom voice assistant. "
-                    "Answer in concise Vietnamese. "
-                    "Focus on SIM offers and telecom package lookup."
+                    "Bạn là trợ lý giọng nói VNPost Telecom. "
+                    "Luôn trả lời tiếng Việt có dấu, ngắn gọn, rõ ràng. "
+                    "Ưu tiên tư vấn gói cước, ưu đãi SIM và tra cứu thuê bao."
                 ),
                 lines=3,
             )
@@ -272,31 +283,32 @@ def build_ui() -> gr.Blocks:
                 )
 
         with gr.Tabs():
-            with gr.Tab("Text Chat"):
+            with gr.Tab("Nhập văn bản"):
                 with gr.Row():
                     text_input = gr.Textbox(
-                        label="User Message",
+                        label="Tin nhắn người dùng",
                         lines=2,
-                        placeholder="Nhap cau hoi ve goi cuoc, mua SIM, uu dai...",
+                        placeholder="Nhập câu hỏi về gói cước, mua SIM, ưu đãi...",
                     )
                 with gr.Row():
-                    send_btn = gr.Button("Send", variant="primary")
-                    clear_btn = gr.Button("Clear Conversation")
+                    send_btn = gr.Button("Gửi", variant="primary")
+                    clear_btn = gr.Button("Xóa hội thoại")
 
-            with gr.Tab("Voice Input"):
+            with gr.Tab("Nhập giọng nói"):
                 audio_input = gr.Audio(
                     sources=["microphone", "upload"],
                     type="filepath",
-                    label="Record or upload audio",
+                    label="Ghi âm hoặc tải file audio",
                 )
                 with gr.Row():
-                    transcribe_btn = gr.Button("Transcribe Audio")
-                    send_transcript_btn = gr.Button("Send Transcript", variant="primary")
+                    transcribe_btn = gr.Button("Chuyển giọng nói thành văn bản")
+                    send_transcript_btn = gr.Button("Gửi transcript", variant="primary")
                 transcript_box = gr.Textbox(label="Transcript", lines=3)
 
         common_inputs = [
             chat_history,
             llm_state,
+            tool_state,
             base_url,
             model_name,
             system_prompt,
@@ -310,12 +322,12 @@ def build_ui() -> gr.Blocks:
         send_btn.click(
             fn=lambda user_text, *args: _chat_once(user_text, *args),
             inputs=[text_input, *common_inputs],
-            outputs=[text_input, chat_history, llm_state, status],
+            outputs=[text_input, chat_history, llm_state, tool_state, status],
         )
         text_input.submit(
             fn=lambda user_text, *args: _chat_once(user_text, *args),
             inputs=[text_input, *common_inputs],
-            outputs=[text_input, chat_history, llm_state, status],
+            outputs=[text_input, chat_history, llm_state, tool_state, status],
         )
 
         transcribe_btn.click(
@@ -335,13 +347,13 @@ def build_ui() -> gr.Blocks:
         send_transcript_btn.click(
             fn=lambda user_text, *args: _chat_once(user_text, *args),
             inputs=[transcript_box, *common_inputs],
-            outputs=[transcript_box, chat_history, llm_state, status],
+            outputs=[transcript_box, chat_history, llm_state, tool_state, status],
         )
 
         clear_btn.click(
             fn=_reset_conversation,
             inputs=[],
-            outputs=[chat_history, llm_state, text_input, status],
+            outputs=[chat_history, llm_state, tool_state, text_input, status],
         )
 
     return demo
