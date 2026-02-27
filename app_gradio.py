@@ -735,12 +735,11 @@ def _reset_conversation() -> tuple[
     list[dict[str, str]],
     dict,
     str,
-    str,
     dict[str, Any],
     str,
     Any,
 ]:
-    return [], [], {}, "", "Đã xóa lịch sử hội thoại.", _new_realtime_state(), "", None
+    return [], [], {}, "Đã xóa lịch sử hội thoại.", _new_realtime_state(), "", None
 
 
 def build_ui() -> gr.Blocks:
@@ -752,7 +751,7 @@ def build_ui() -> gr.Blocks:
         gr.Markdown(
             """
             # VNPost Telecom Callbot (Gradio)
-            Demo văn bản + giọng nói với:
+            Demo realtime microphone với:
             - ASR: PhoWhisper-small (CTranslate2 via faster-whisper)
             - LLM: vLLM OpenAI-compatible API
             - Yêu cầu chat luôn dùng `enable_thinking=false`
@@ -816,109 +815,88 @@ def build_ui() -> gr.Blocks:
                     label="ASR Log Prob Threshold",
                 )
 
-        with gr.Tabs():
-            with gr.Tab("Nhập văn bản"):
-                with gr.Row():
-                    text_input = gr.Textbox(
-                        label="Tin nhắn người dùng",
-                        lines=2,
-                        placeholder="Nhập câu hỏi về gói cước, mua SIM, ưu đãi...",
-                    )
-                with gr.Row():
-                    send_btn = gr.Button("Gửi", variant="primary")
-                    clear_btn = gr.Button("Xóa hội thoại")
-
-            with gr.Tab("Nhập giọng nói"):
-                audio_input = gr.Audio(
-                    sources=["microphone", "upload"],
-                    type="filepath",
-                    label="Ghi âm hoặc tải file audio",
-                )
-                with gr.Row():
-                    transcribe_btn = gr.Button("Chuyển giọng nói thành văn bản")
-                    send_transcript_btn = gr.Button("Gửi transcript", variant="primary")
-                transcript_box = gr.Textbox(label="Transcript", lines=3)
-                gr.Markdown("### Realtime mic (tự gửi khi bạn dừng nói)")
-                realtime_enabled = gr.Checkbox(
-                    label="Bật realtime voice",
-                    value=False,
-                    info="Khi bật, bot tự nhận tiếng nói và tự phản hồi, không cần bấm Gửi transcript.",
-                )
-                with gr.Row():
-                    realtime_rms_threshold = gr.Slider(
-                        0.005,
-                        0.06,
-                        value=0.012,
-                        step=0.001,
-                        label="Realtime RMS threshold",
-                    )
-                    realtime_min_speech_ms = gr.Slider(
-                        120,
-                        800,
-                        value=240,
-                        step=20,
-                        label="Realtime Min Speech (ms)",
-                    )
-                    realtime_endpoint_silence_ms = gr.Slider(
-                        250,
-                        1400,
-                        value=520,
-                        step=20,
-                        label="Realtime Endpoint Silence (ms)",
-                    )
-                realtime_audio = gr.Audio(
-                    sources=["microphone"],
-                    type="numpy",
-                    streaming=True,
-                    label="Realtime microphone stream",
-                )
-                realtime_transcript = gr.Textbox(
-                    label="Transcript realtime (auto)",
-                    lines=2,
-                    interactive=False,
-                )
-                gr.Markdown("### Realtime bot voice")
-                realtime_tts_enabled = gr.Checkbox(
-                    label="Bật bot trả lời bằng giọng nói",
-                    value=VIENEU_AVAILABLE,
-                    info=(
-                        "Dùng VieNeu-TTS để phát audio bot ngay trong trình duyệt."
-                        if VIENEU_AVAILABLE
-                        else "Chưa có package vieneu. Cài thêm rồi bật checkbox này."
-                    ),
-                )
-                with gr.Row():
-                    realtime_tts_backbone_repo = gr.Textbox(
-                        label="TTS Backbone Repo",
-                        value="pnnbao-ump/VieNeu-TTS-0.3B-q4-gguf",
-                    )
-                    realtime_tts_backbone_device = gr.Dropdown(
-                        label="TTS Backbone Device",
-                        choices=["cpu", "cuda", "mps"],
-                        value="cpu",
-                    )
-                with gr.Row():
-                    realtime_tts_codec_repo = gr.Textbox(
-                        label="TTS Codec Repo",
-                        value="neuphonic/distill-neucodec",
-                    )
-                    realtime_tts_codec_device = gr.Dropdown(
-                        label="TTS Codec Device",
-                        choices=["cpu", "cuda", "mps"],
-                        value="cpu",
-                    )
-                    realtime_tts_voice_id = gr.Textbox(
-                        label="TTS Voice ID (optional)",
-                        value="",
-                    )
-                bot_audio_kwargs: dict[str, Any] = {
-                    "label": "Audio bot realtime",
-                    "type": "numpy",
-                    "interactive": False,
-                }
-                if AUDIO_SUPPORTS_AUTOPLAY:
-                    bot_audio_kwargs["autoplay"] = True
-                realtime_bot_audio = gr.Audio(**bot_audio_kwargs)
+        gr.Markdown("## Realtime mic (tự gửi khi bạn dừng nói)")
+        realtime_enabled = gr.Checkbox(
+            label="Bật realtime voice",
+            value=True,
+            info="Bot tự nhận tiếng nói và tự phản hồi, không có turn-based input.",
+        )
+        with gr.Row():
+            realtime_rms_threshold = gr.Slider(
+                0.005,
+                0.06,
+                value=0.012,
+                step=0.001,
+                label="Realtime RMS threshold",
+            )
+            realtime_min_speech_ms = gr.Slider(
+                120,
+                800,
+                value=240,
+                step=20,
+                label="Realtime Min Speech (ms)",
+            )
+            realtime_endpoint_silence_ms = gr.Slider(
+                250,
+                1400,
+                value=520,
+                step=20,
+                label="Realtime Endpoint Silence (ms)",
+            )
+        realtime_audio = gr.Audio(
+            sources=["microphone"],
+            type="numpy",
+            streaming=True,
+            label="Realtime microphone stream",
+        )
+        realtime_transcript = gr.Textbox(
+            label="Transcript realtime (auto)",
+            lines=2,
+            interactive=False,
+        )
+        gr.Markdown("### Realtime bot voice")
+        realtime_tts_enabled = gr.Checkbox(
+            label="Bật bot trả lời bằng giọng nói",
+            value=VIENEU_AVAILABLE,
+            info=(
+                "Dùng VieNeu-TTS để phát audio bot ngay trong trình duyệt."
+                if VIENEU_AVAILABLE
+                else "Chưa có package vieneu. Cài thêm rồi bật checkbox này."
+            ),
+        )
+        with gr.Row():
+            realtime_tts_backbone_repo = gr.Textbox(
+                label="TTS Backbone Repo",
+                value="pnnbao-ump/VieNeu-TTS-0.3B-q4-gguf",
+            )
+            realtime_tts_backbone_device = gr.Dropdown(
+                label="TTS Backbone Device",
+                choices=["cpu", "cuda", "mps"],
+                value="cpu",
+            )
+        with gr.Row():
+            realtime_tts_codec_repo = gr.Textbox(
+                label="TTS Codec Repo",
+                value="neuphonic/distill-neucodec",
+            )
+            realtime_tts_codec_device = gr.Dropdown(
+                label="TTS Codec Device",
+                choices=["cpu", "cuda", "mps"],
+                value="cpu",
+            )
+            realtime_tts_voice_id = gr.Textbox(
+                label="TTS Voice ID (optional)",
+                value="",
+            )
+        bot_audio_kwargs: dict[str, Any] = {
+            "label": "Audio bot realtime",
+            "type": "numpy",
+            "interactive": False,
+        }
+        if AUDIO_SUPPORTS_AUTOPLAY:
+            bot_audio_kwargs["autoplay"] = True
+        realtime_bot_audio = gr.Audio(**bot_audio_kwargs)
+        clear_btn = gr.Button("Xóa hội thoại")
 
         common_inputs = [
             chat_history,
@@ -933,37 +911,6 @@ def build_ui() -> gr.Blocks:
             top_p,
             max_tokens,
         ]
-
-        send_btn.click(
-            fn=lambda user_text, *args: _chat_once(user_text, *args),
-            inputs=[text_input, *common_inputs],
-            outputs=[text_input, chat_history, llm_state, tool_state, status],
-        )
-        text_input.submit(
-            fn=lambda user_text, *args: _chat_once(user_text, *args),
-            inputs=[text_input, *common_inputs],
-            outputs=[text_input, chat_history, llm_state, tool_state, status],
-        )
-
-        transcribe_btn.click(
-            fn=_transcribe_audio,
-            inputs=[
-                audio_input,
-                asr_model_path,
-                asr_device,
-                asr_compute_type,
-                asr_language,
-                asr_beam_size,
-                asr_no_speech_threshold,
-                asr_log_prob_threshold,
-            ],
-            outputs=[transcript_box, status],
-        )
-        send_transcript_btn.click(
-            fn=lambda user_text, *args: _chat_once(user_text, *args),
-            inputs=[transcript_box, *common_inputs],
-            outputs=[transcript_box, chat_history, llm_state, tool_state, status],
-        )
 
         realtime_audio.stream(
             fn=_realtime_stream_step,
@@ -1017,7 +964,6 @@ def build_ui() -> gr.Blocks:
                 chat_history,
                 llm_state,
                 tool_state,
-                text_input,
                 status,
                 realtime_state,
                 realtime_transcript,
